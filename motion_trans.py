@@ -45,7 +45,7 @@ print()
 # Given Euler angles in degrees
 rx_deg = 84.574
 ry_deg = -2.1905
-rz_deg = -64.732
+rz_deg = 64.732
 
 rx = np.radians(rx_deg)
 ry = np.radians(ry_deg)
@@ -74,7 +74,7 @@ Rz = np.array([
 R_blender = Rx @ Ry @ Rz
 
 # Camera position in world coordinates
-cam_pos = np.array([-13.923, -10.286, 2.4484])
+cam_pos = np.array([13.923, -10.286, 2.4484])
 
 # ---- Blender to OpenCV conversion ----
 # Blender camera looks down -Z_local with Y_local up

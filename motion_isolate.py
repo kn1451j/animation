@@ -3,23 +3,32 @@ motion_isolate.py  (v9)
 -----------------------
 Tracks a small moving blob via SimpleBlobDetector on optical flow magnitude.
 - Dual-polarity detection (normal + inverted flow map)
-- Direction-clamped anchor: velocity can decelerate to zero but never reverse
-- Fixed-size circular mask (--dilate radius)
-- On miss: anchor stays put
-- Outputs per-frame PNGs + tracked.mp4 (LOCKED frames only)
+- Anchor smoothed by median-of-last-N + EMA (kills per-frame detection jitter)
+- Per-frame mask: fixed-radius radial vignette (soft edges), lightly warped by the
+  thresholded flow silhouette, then EMA-blended across frames (aligned to the
+  current anchor) so the mask shape stays roughly constant size and only waves
+  around the edges from frame to frame
+- On miss: anchor stays put, mask falls back to the vignette at the held anchor
+- Outputs per-frame PNGs to {output_dir}/frames/ + tracked.mp4 (LOCKED frames only)
 
 Usage:
     python motion_isolate.py ./vids/moving_objects/bug.mp4 ./vids/moving_objects/bug/
     python motion_isolate.py ... --dilate 80 --debug
 
 Dependencies:
-    pip install opencv-python-headless numpy tqdm
+    pip install opencv-python-headless numpy tqdm scipy
 """
 
 import cv2
 import numpy as np
 import argparse
+from collections import namedtuple, deque
 from pathlib import Path
+
+TrajEntry = namedtuple(
+    "TrajEntry",
+    "idx cx cy is_locked mask_crop crop_x0 crop_y0",
+)
 
 try:
     from tqdm import tqdm
@@ -102,12 +111,161 @@ def clamp_direction(proposed, current, last_delta):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-frame detection mask (dilation of thresholded flow silhouette)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detection_mask(mag_norm: np.ndarray, inverted: bool, anchor: tuple,
+                   kp_size: float, det_thresh: int, dilate: int,
+                   h: int, w: int) -> np.ndarray:
+    """Threshold the flow-magnitude map (matching the blob-detector polarity),
+    keep only the connected component that contains the anchor, then
+    morphologically dilate by `dilate` px with a circular kernel.
+
+    Returns a full-frame uint8 mask (0/255). The dilation happens on the
+    per-frame bug silhouette, so the mask shape follows the detection instead
+    of always being a fixed-radius circle.
+    """
+    det_mag = (255 - mag_norm) if inverted else mag_norm
+    det_binary = (det_mag > det_thresh).astype(np.uint8) * 255
+
+    # Confine to a reasonable neighborhood of the anchor so we don't grab
+    # unrelated moving regions (camera shake, other objects).
+    confine_r = int(max(kp_size, 10.0) * 2 + dilate)
+    confine = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(confine, (int(anchor[0]), int(anchor[1])), confine_r, 255, -1)
+    det_binary = cv2.bitwise_and(det_binary, confine)
+
+    # Extract only the connected component containing the anchor
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(det_binary, connectivity=8)
+    if n <= 1:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    ax = int(np.clip(anchor[0], 0, w - 1))
+    ay = int(np.clip(anchor[1], 0, h - 1))
+    anchor_lbl = int(labels[ay, ax])
+    if anchor_lbl == 0:
+        # Anchor fell on background — use the closest non-zero pixel's component
+        ys_nz, xs_nz = np.nonzero(det_binary)
+        if xs_nz.size == 0:
+            return np.zeros((h, w), dtype=np.uint8)
+        d2 = (xs_nz - ax) ** 2 + (ys_nz - ay) ** 2
+        j = int(np.argmin(d2))
+        anchor_lbl = int(labels[ys_nz[j], xs_nz[j]])
+        if anchor_lbl == 0:
+            return np.zeros((h, w), dtype=np.uint8)
+
+    component = np.where(labels == anchor_lbl, 255, 0).astype(np.uint8)
+
+    k = 2 * dilate + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(component, kernel)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smoothing post-process
+# ─────────────────────────────────────────────────────────────────────────────
+
+def smooth_pass(args, video_path: str, output_dir: Path,
+                trajectory: list, fps: float, h: int, w: int) -> None:
+    """Fit a cubic spline through a subset of trajectory frames and re-emit
+    each frame with the masked bug content pasted at the smoothed position.
+
+    Outputs:
+        - {output_dir}/smooth_bug/frame_{idx+1:06d}.png   (RGBA, transparent BG)
+        - {output_dir}/smooth_tracked.mp4                 (BGR over black)
+    """
+    from scipy.interpolate import CubicSpline
+
+    N = len(trajectory)
+    if N < 4:
+        print("  ⚠  trajectory too short for cubic spline; skipping smoothing pass.")
+        return
+
+    T  = np.array([t.idx for t in trajectory], dtype=np.float64)
+    xs = np.array([t.cx  for t in trajectory], dtype=np.float64)
+    ys = np.array([t.cy  for t in trajectory], dtype=np.float64)
+
+    K = max(4, min(args.smooth_knots, N))
+    knot_idx = np.unique(np.linspace(0, N - 1, K, dtype=int))
+    if len(knot_idx) < 4:
+        print("  ⚠  not enough distinct knots; skipping smoothing pass.")
+        return
+
+    cs_x = CubicSpline(T[knot_idx], xs[knot_idx], bc_type="natural")
+    cs_y = CubicSpline(T[knot_idx], ys[knot_idx], bc_type="natural")
+    xs_s = cs_x(T)
+    ys_s = cs_y(T)
+
+    smooth_dir = output_dir / "smooth_bug"
+    smooth_dir.mkdir(exist_ok=True)
+    smooth_vid = output_dir / "smooth_tracked.mp4"
+    vw = cv2.VideoWriter(str(smooth_vid), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"smooth_pass: cannot reopen {video_path}")
+
+    cur = -1
+    frame = None
+    it = range(N)
+    if HAS_TQDM:
+        it = tqdm(it, unit="frame", desc="smoothing")
+
+    for i in it:
+        entry = trajectory[i]
+        while cur < entry.idx:
+            ret, frame = cap.read()
+            cur += 1
+            if not ret:
+                cap.release(); vw.release()
+                print("  ⚠  smooth_pass: video ended before trajectory did.")
+                return
+
+        # Reconstruct full-frame mask from the stored per-frame detection crop
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if entry.mask_crop is not None:
+            mh, mw = entry.mask_crop.shape
+            y0, x0 = entry.crop_y0, entry.crop_x0
+            mask[y0:y0+mh, x0:x0+mw] = entry.mask_crop
+        else:
+            cv2.circle(mask, (int(entry.cx), int(entry.cy)), args.dilate, 255, -1)
+
+        bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+        bgra[..., 3] = mask
+
+        dx = float(xs_s[i] - entry.cx)
+        dy = float(ys_s[i] - entry.cy)
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        shifted = cv2.warpAffine(
+            bgra, M, (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+
+        cv2.imwrite(str(smooth_dir / f"frame_{entry.idx+1:06d}.png"), shifted)
+
+        alpha   = shifted[..., 3:4].astype(np.float32) / 255.0
+        bgr_out = (shifted[..., :3].astype(np.float32) * alpha).astype(np.uint8)
+        if entry.is_locked:
+            vw.write(bgr_out)
+
+    cap.release()
+    vw.release()
+    print(f"✓ Smoothed frames in: {smooth_dir.resolve()}")
+    print(f"   Smoothed video:    {smooth_vid.resolve()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    frames_dir = output_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
 
     debug_dir = output_dir / "_debug"
     if args.debug:
@@ -133,11 +291,19 @@ def process(args) -> None:
 
     # Tracker state
     frame_cx, frame_cy = w / 2.0, h / 2.0
-    anchor      = (frame_cx, frame_cy)
-    locked      = False
-    ever_locked = False
-    misses      = 0
-    total_miss  = 0
+    anchor       = (frame_cx, frame_cy)
+    ema_anchor   = (frame_cx, frame_cy)
+    anchor_hist  = deque(maxlen=max(1, args.anchor_median))
+    last_kp_size = 20.0
+    locked       = False
+    ever_locked  = False
+    misses       = 0
+    total_miss   = 0
+    trajectory   = []  # TrajEntry per ever_locked frame, for smooth_pass
+
+    # Soft-mask temporal blend state
+    prev_blended        = None  # full-frame uint8 soft mask from previous frame
+    prev_blended_anchor = None  # (x, y) associated with prev_blended
 
     init_r   = min(w, h) * args.init_radius_frac
     relost_r = args.max_jump * 1.5
@@ -177,16 +343,37 @@ def process(args) -> None:
         is_locked_frame   = False
 
         if best_kp is not None:
-            anchor      = best_kp.pt
-            locked      = True
-            ever_locked = True
-            misses      = 0
+            raw_pt = (float(best_kp.pt[0]), float(best_kp.pt[1]))
+
+            if not locked:
+                # Fresh lock (initial or re-lock after lost): snap smoothers to raw
+                anchor_hist.clear()
+                anchor_hist.append(raw_pt)
+                ema_anchor = raw_pt
+                prev_blended = None
+                prev_blended_anchor = None
+            else:
+                anchor_hist.append(raw_pt)
+                med_x = float(np.median([p[0] for p in anchor_hist]))
+                med_y = float(np.median([p[1] for p in anchor_hist]))
+                a = args.anchor_ema
+                ema_anchor = (
+                    a * med_x + (1.0 - a) * ema_anchor[0],
+                    a * med_y + (1.0 - a) * ema_anchor[1],
+                )
+
+            anchor          = ema_anchor
+            last_kp_size    = float(best_kp.size)
+            locked          = True
+            ever_locked     = True
+            misses          = 0
             is_locked_frame = True
 
             if args.debug:
                 polarity = "INV" if inverted else "NRM"
                 print(f"  frame {idx+1:04d} [LOCKED/{polarity}]"
-                      f"  centre=({anchor[0]:.0f},{anchor[1]:.0f})")
+                      f"  centre=({anchor[0]:.0f},{anchor[1]:.0f})"
+                      f"  raw=({raw_pt[0]:.0f},{raw_pt[1]:.0f})")
         else:
             total_miss += 1
             if locked:
@@ -212,13 +399,72 @@ def process(args) -> None:
 
         # Write output whenever we have a lock or are holding position
         if ever_locked:
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(mask, (int(anchor[0]), int(anchor[1])), args.dilate, 255, -1)
-            mask_3ch  = np.stack([mask] * 3, axis=2)
-            out_frame = np.where(mask_3ch, frame, 0).astype(np.uint8)
-            cv2.imwrite(str(output_dir / f"frame_{idx+1:06d}.png"), out_frame)
+            # Per-frame binary detection silhouette (or fallback disc if we missed)
+            if best_kp is not None:
+                det_binary = detection_mask(
+                    mag_norm, inverted, anchor, last_kp_size,
+                    args.det_thresh, args.dilate, h, w,
+                )
+                if cv2.countNonZero(det_binary) == 0:
+                    det_binary = np.zeros((h, w), dtype=np.uint8)
+                    cv2.circle(det_binary, (int(anchor[0]), int(anchor[1])), args.dilate, 255, -1)
+            else:
+                det_binary = np.zeros((h, w), dtype=np.uint8)
+                cv2.circle(det_binary, (int(anchor[0]), int(anchor[1])), args.dilate, 255, -1)
+
+            feather = max(int(args.mask_feather), 1)
+            kdim    = 2 * feather + 1
+            det_soft = cv2.GaussianBlur(det_binary, (kdim, kdim), 0).astype(np.float32) / 255.0
+
+            # Fixed-radius radial vignette at the anchor: soft disc, stable size
+            disc = np.zeros((h, w), dtype=np.float32)
+            cv2.circle(disc, (int(anchor[0]), int(anchor[1])),
+                       max(args.dilate - feather, 1), 1.0, -1)
+            vignette = cv2.GaussianBlur(disc, (kdim, kdim), 0)
+
+            # Let the detection only lightly warp the vignette's edge (size stays put)
+            warp_s   = float(args.mask_warp)
+            mask_raw = vignette * (1.0 - warp_s * (1.0 - det_soft))
+            mask_raw = np.clip(mask_raw, 0.0, 1.0)
+            mask_now = (mask_raw * 255.0).astype(np.uint8)
+
+            # Temporal EMA across frames, aligned to the current anchor so motion
+            # doesn't smear the shape (purely shape-blending, not position-blending)
+            if prev_blended is not None and prev_blended_anchor is not None:
+                dx = float(anchor[0] - prev_blended_anchor[0])
+                dy = float(anchor[1] - prev_blended_anchor[1])
+                M = np.float32([[1, 0, dx], [0, 1, dy]])
+                prev_aligned = cv2.warpAffine(
+                    prev_blended, M, (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                )
+                a_blend = float(args.mask_blend)
+                mask = cv2.addWeighted(mask_now, a_blend, prev_aligned, 1.0 - a_blend, 0.0)
+            else:
+                mask = mask_now.copy()
+
+            prev_blended        = mask
+            prev_blended_anchor = (float(anchor[0]), float(anchor[1]))
+
+            # Apply the soft mask as a real alpha multiply (not a hard np.where)
+            alpha_f   = (mask.astype(np.float32) / 255.0)[..., None]
+            out_frame = (frame.astype(np.float32) * alpha_f).astype(np.uint8)
+            cv2.imwrite(str(frames_dir / f"frame_{idx+1:06d}.png"), out_frame)
             if is_locked_frame:
                 vwriter.write(out_frame)
+
+            bx, by, bw_, bh_ = cv2.boundingRect(mask)
+            if bw_ > 0 and bh_ > 0:
+                mask_crop = mask[by:by+bh_, bx:bx+bw_].copy()
+                crop_x0, crop_y0 = int(bx), int(by)
+            else:
+                mask_crop = None
+                crop_x0 = crop_y0 = 0
+            trajectory.append(TrajEntry(
+                idx, float(anchor[0]), float(anchor[1]), is_locked_frame,
+                mask_crop, crop_x0, crop_y0,
+            ))
 
         prev_gray = gray
 
@@ -226,8 +472,13 @@ def process(args) -> None:
     vwriter.release()
     if total_miss:
         print(f"  ⚠  {total_miss} frames had no qualifying blob.")
-    print(f"\n✓ Done — frames in: {output_dir.resolve()}")
+    print(f"\n✓ Done — frames in: {frames_dir.resolve()}")
     print(f"   Video (LOCKED only): {vid_path.resolve()}")
+
+    if not args.skip_smooth and trajectory:
+        smooth_pass(args, args.video, output_dir, trajectory, fps, h, w)
+    elif not trajectory:
+        print("  ⚠  no trajectory recorded; skipping smoothing pass.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,8 +497,25 @@ def main():
     p.add_argument("--max-jump",         type=int,   default=59)
     p.add_argument("--init-radius-frac", type=float, default=0.25)
     p.add_argument("--miss-limit",       type=int,   default=12)
-    p.add_argument("--dilate",           type=int,   default=80)
+    p.add_argument("--dilate",           type=int,   default=130,
+                   help="Morphological dilation radius (px) applied to the per-frame detection silhouette.")
+    p.add_argument("--det-thresh",       type=int,   default=150,
+                   help="Flow-magnitude threshold (0-255) used to extract the bug silhouette before dilation.")
+    p.add_argument("--mask-feather",     type=int,   default=25,
+                   help="Gaussian feather radius (px) for the vignette + detection softening.")
+    p.add_argument("--mask-warp",        type=float, default=0.45,
+                   help="Fraction of the vignette's edge the per-frame detection may warp (0-1).")
+    p.add_argument("--mask-blend",       type=float, default=0.5,
+                   help="EMA weight for the current frame's mask (lower = more shape inertia from prior frames).")
+    p.add_argument("--anchor-ema",       type=float, default=0.3,
+                   help="EMA weight for new anchor samples after median filtering (lower = smoother, more lag).")
+    p.add_argument("--anchor-median",    type=int,   default=5,
+                   help="Median-filter window size over recent raw blob detections.")
     p.add_argument("--smooth",           type=float, default=0.65)
+    p.add_argument("--smooth-knots",     type=int,   default=15,
+                   help="Number of cubic-spline knots sampled uniformly across the trajectory.")
+    p.add_argument("--skip-smooth",      action="store_true",
+                   help="Disable the trajectory-smoothing post-processing pass.")
     p.add_argument("--debug",            action="store_true")
     args = p.parse_args()
     process(args)

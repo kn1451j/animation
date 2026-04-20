@@ -87,6 +87,10 @@ namespace hom {
         { 0.017365f,  1.066689f, -38.550526f },
         { 0.00003f,   0.0f,        1.0f      }
     };
+    static constexpr float H_right[3][3] = 
+    {{  0.820061,  -0.015444, -44.729205},
+    { -0.028322,   1.004358,  -6.78747 },
+    { -0.000028,  -0.000002,   1.0f      }};
 }
 
 static void mat3Mul(const float A[3][3], const float B[3][3], float C[3][3]) {
@@ -119,26 +123,11 @@ static glm::mat4 embedHom(const float H[3][3]) {
     );
 }
 
-// Returns the GL model matrix for cycle pair k (0 = identity).
-static glm::mat4 cycleTransform(int pair) {
-    if (pair == 0) return glm::mat4(1.f);
-    float Hn[3][3];
-    homPixToNDC(hom::H, Hn);
-    float result[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
-    for (int i=0; i<pair; ++i) {
-        float tmp[3][3];
-        mat3Mul(result, Hn, tmp);
-        memcpy(result, tmp, sizeof(tmp));
-    }
-    return embedHom(result);
-}
-
 // ============================================================================
 // APP STATE
 // ============================================================================
-enum class AppState { TITLE, INTRO, BACK_POSE, ENTERING_RIGHT, WALKING_RIGHT };
-// TODO: WALKING_LEFT, OVERLAY_1/2/3
-enum class WalkSub  { IDLE, LEFT_FOOT, RIGHT_FOOT, SHAKE_HEAD };
+enum class AppState { TITLE, INTRO, BACK_POSE, ENTERING_RIGHT, WALKING_RIGHT, WALKING_LEFT };
+enum class WalkSub  { IDLE, LEFT_FOOT, RIGHT_FOOT, SHAKE_HEAD, TURN};
 
 // ============================================================================
 // OPENGL HELPERS
@@ -399,6 +388,7 @@ struct VideoDecoder {
     AVFrame*         frm  = nullptr;
     int vsi=-1, asi=-1, w=0, h=0;
     bool eof = false;
+    bool loopVideo = false;
 
     std::vector<float>  audioBuf;
     std::atomic<size_t> audioPos{0};
@@ -465,10 +455,19 @@ struct VideoDecoder {
         return true;
     }
 
+    void seekToStart() {
+        av_seek_frame(fmt,-1,0,AVSEEK_FLAG_BACKWARD);
+        if (vctx) avcodec_flush_buffers(vctx);
+        eof=false;
+    }
+
     bool nextVideoFrame(uint8_t* dst) {
         while (!eof) {
             int ret=av_read_frame(fmt,pkt);
-            if (ret<0){eof=true;break;}
+            if (ret<0){
+                if (loopVideo){ seekToStart(); continue; }
+                eof=true; break;
+            }
             if (pkt->stream_index==vsi&&vctx) {
                 avcodec_send_packet(vctx,pkt);
                 ret=avcodec_receive_frame(vctx,frm);
@@ -573,8 +572,11 @@ struct AudioMixer {
         if (self->walkPlay&&self->walkPlay->load()&&self->walkPcm) {
             auto& wb=*self->walkPcm;
             size_t wp=self->walkPos->load();
+            // Softer than video audio (which mixes at 0.8x) so walking sits
+            // under the bg audio instead of masking it.
+            constexpr float kWalkGain = 0.5f;
             for (ma_uint32 i=0;i<frames*cfg::AUDIO_CH&&wp<wb.size();++i,++wp)
-                dst[i]+=wb[wp];
+                dst[i]+=wb[wp]*kWalkGain;
             if (wp>=wb.size()) {
                 if (self->walkLoop->load()) wp=0;
                 else{self->walkPlay->store(false);wp=0;}
@@ -625,6 +627,9 @@ struct App {
 
     TitleScreen title;
 
+    // Title audio
+    VideoDecoder titleAudio;
+
     // Intro video
     VideoDecoder introVid;
     GLuint       introTex = 0;
@@ -632,12 +637,24 @@ struct App {
     double lastIntroTime  = 0.0;
     double introFrameTime = 1.0/30.0;
 
-    // Background PNG sequence (looping, replaces loop video)
+    // Background video (station.mp4 or grass.mp4, looping)
+    VideoDecoder bgVid;
+    GLuint       bgVidTex = 0;
+    std::vector<uint8_t> bgVidRgb;
+    double lastBgVidTime  = 0.0;
+    double bgVidFrameTime = 1.0/24.0;
+
+    // Background PNG sequence (waves overlay at 0.5 alpha)
     SpriteSeq seqBg;
     int       bgCur      = 0;
     double    lastBgTime = 0.0;
     double    bgFrameTime= 1.0/cfg::SPRITE_FPS;
     GLuint    bgTex      = 0;
+
+    // Scene state
+    bool inGrassScene     = false;
+    bool showWavesOverlay = false;
+    bool firstStepTaken   = false;
 
     // Optional outro overlay — drawn over dimmed background in WALKING_RIGHT
     // Populate renders/outro/ to activate; silent failure if missing.
@@ -647,7 +664,8 @@ struct App {
 
     // Sprite sequences
     SpriteSeq seqBackPose, seqEnterRight;
-    SpriteSeq seqLeftFoot, seqRightFoot, seqShakeHead;
+    SpriteSeq seqLeftFoot, seqRightFoot, seqShakeHead, seqTurnLeft;
+    SpriteSeq seqWLTurnRight, seqWLLeftFoot, seqWLRightFoot, seqWLShakeHead;
 
     double lastSpriteTime  = 0.0;
     double spriteFrameTime = 1.0/cfg::SPRITE_FPS;
@@ -664,30 +682,152 @@ struct App {
     // Input — set only by key callback (GLFW_PRESS), never by polling
     bool anyKeyPressed   = false;
     bool rightKeyPressed = false;
+    bool leftKeyPressed  = false;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-    void updateSpriteMatrix() { spriteMatrix=cycleTransform(stepCount/2); }
+    void updateSpriteMatrix() {
+        int pair = stepCount / 2;
+        // Returns the GL model matrix for cycle pair k (0 = identity).
+        // Positive k → H^k (walk right), negative k → (H_ndc^|k|)^-1 (walk left).
+        // For negative k we accumulate H^|k| in NDC first, then invert the result
+        // to avoid compounding rounding errors from pre-inverting H in pixel space.
+        if (pair == 0) spriteMatrix = glm::mat4(1.f);
+        float Hn[3][3];
+        homPixToNDC(hom::H, Hn);
+        float result[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
+        for (int i=0; i<pair; ++i) {
+            float tmp[3][3];
+            mat3Mul(result, Hn, tmp);
+            memcpy(result, tmp, sizeof(tmp));
+        }
+        spriteMatrix = embedHom(result);
+    }
 
     // Used for hold-to-walk: polls directly rather than relying on callback flag
     bool rightHeld() const { return glfwGetKey(win,GLFW_KEY_RIGHT)==GLFW_PRESS; }
+    bool leftHeld()  const { return glfwGetKey(win,GLFW_KEY_LEFT)==GLFW_PRESS; }
 
-    void stepWalk() {
-        if (stepCount>=cfg::MAX_CYCLES*2) {
-            seqShakeHead.reset(); walkSub=WalkSub::SHAKE_HEAD; return;
+    void switchBgVideo(const std::string& path) {
+        // Detach the mixer from bgVid while we tear it down and repopulate
+        // audioBuf — the callback runs on a separate thread and would read
+        // freed/partial data otherwise.
+        VideoDecoder* prev = mixer.vidSrc;
+        mixer.vidSrc = nullptr;
+        bgVid.close();
+        bgVid.eof=false; bgVid.loopVideo=false;
+        bgVid.vsi=-1; bgVid.asi=-1; bgVid.w=0; bgVid.h=0;
+        bgVid.audioPos.store(0);
+        bgVid.audioBuf.clear();
+        if (!bgVid.open(path,true)) {
+            std::cerr<<"[bg] Cannot open "<<path<<"\n";
+            mixer.vidSrc = prev;
+            return;
         }
+        bgVid.loopVideo=true;
+        bgVid.preDecodeAudio();
+        if (bgVid.vsi>=0) {
+            AVRational r=bgVid.fmt->streams[bgVid.vsi]->avg_frame_rate;
+            if (r.num>0) bgVidFrameTime=(double)r.den/r.num;
+        }
+        bgVid.nextVideoFrame(bgVidRgb.data());
+        glBindTexture(GL_TEXTURE_2D,bgVidTex);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,bgVid.w,bgVid.h,
+                        GL_RGB,GL_UNSIGNED_BYTE,bgVidRgb.data());
+        mixer.vidSrc = prev;
+    }
+
+    void sceneTransition() {
+        // Scene transition instead of shake_head
+        stepCount=0;
+        spriteMatrix=glm::mat4(1.f);
+        if (!inGrassScene) {
+            switchBgVideo("vids/splice/grass.mp4");
+            inGrassScene=true;
+            showWavesOverlay=false;
+        } else {
+            switchBgVideo("vids/splice/station.mp4");
+            inGrassScene=false;
+            showWavesOverlay=true;
+        }
+        walkSub=WalkSub::IDLE;
+        walkClip.stop();
+        return;
+    }
+
+    void startWalking() {
+        if (!firstStepTaken) {
+            firstStepTaken=true;
+            if (!inGrassScene) showWavesOverlay=true;
+        }
+        // matrix should be the same no matter what direction
         updateSpriteMatrix();
+        // logic to decide which foot to move
+        if (walkSub==WalkSub::TURN) {
+            // we stepped left, so step right on the way back
+            if (stepCount == 0 && appState == AppState::WALKING_LEFT)
+                walkSub = WalkSub::SHAKE_HEAD;
+            else if (stepCount > cfg::MAX_CYCLES*2 && appState == AppState::WALKING_RIGHT)
+                sceneTransition();
+            else if (stepCount % 2 == 1)
+                walkSub=WalkSub::RIGHT_FOOT;
+            else // stepped right, so restart w left
+                walkSub=WalkSub::LEFT_FOOT;
+        }
+        if (appState == AppState::WALKING_LEFT){
+
+        }
         if ((stepCount%2)==0) { seqLeftFoot.reset();  walkSub=WalkSub::LEFT_FOOT; }
         else                  { seqRightFoot.reset(); walkSub=WalkSub::RIGHT_FOOT; }
         if (!walkClip.playing) walkClip.play(false);
         else walkClip.looping=true;
     }
 
-    void onStepComplete() {
-        if (walkSub==WalkSub::SHAKE_HEAD) { walkSub=WalkSub::IDLE; return; }
-        ++stepCount;
+    void onMoveComplete() {
+        // nothing to change
+        if (walkSub==WalkSub::SHAKE_HEAD || walkSub==WalkSub::TURN) { walkSub=WalkSub::IDLE; return; }
+        // subtract if we are walking left ow add
+        stepCount += (appState == AppState::WALKING_LEFT ? -1 : 1);
         walkSub=WalkSub::IDLE;
-        if (rightHeld()) stepWalk();
-        else             walkClip.stop();
+    }
+
+    optional<SpriteSeq> advSeq(){
+        switch (walkSub) {
+            case WalkSub::IDLE: None;
+            case WalkSub::LEFT_FOOT:
+                seqLeftFoot.advance();
+                return seqLeftFoot;
+            case WalkSub::RIGHT_FOOT:
+                seqRightFoot.advance();
+                return seqLeftFoot;
+            case WalkSub::SHAKE_HEAD:
+                seqShakeHead.advance();
+                return seqShakeHead;
+            case WalkSub::TURN:
+                seqWLTurnRight.advance();
+                return seqWLTurnRight;
+            default: None;
+            }
+    }
+
+    void stepWalkLeft() {
+        if (stepCount <= 0) {
+            seqWLShakeHead.reset(); walkSub=WalkSub::SHAKE_HEAD; return;
+        }
+        // Keep current cycle position — decrement happens in onStepCompleteLeft
+        updateSpriteMatrix();
+        if ((stepCount%2)==0) { seqWLLeftFoot.reset();  walkSub=WalkSub::LEFT_FOOT; }
+        else                  { seqWLRightFoot.reset(); walkSub=WalkSub::RIGHT_FOOT; }
+        if (!walkClip.playing) walkClip.play(false);
+        else walkClip.looping=true;
+    }
+
+    void onStepCompleteLeft() {
+        if (walkSub==WalkSub::SHAKE_HEAD) { walkSub=WalkSub::IDLE; return; }
+        --stepCount;
+        updateSpriteMatrix();
+        walkSub=WalkSub::IDLE;
+        if (leftHeld()) stepWalkLeft();
+        else            walkClip.stop();
     }
 
     // ── Key callback ─────────────────────────────────────────────────────────
@@ -698,6 +838,7 @@ struct App {
         if (key==GLFW_KEY_ESCAPE){ glfwSetWindowShouldClose(w,GLFW_TRUE); return; }
         a->anyKeyPressed   = true;
         a->rightKeyPressed = (key==GLFW_KEY_RIGHT);
+        a->leftKeyPressed  = (key==GLFW_KEY_LEFT);
     }
 
     // ── Upload helpers ────────────────────────────────────────────────────────
@@ -706,6 +847,13 @@ struct App {
         glBindTexture(GL_TEXTURE_2D,introTex);
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,introVid.w,introVid.h,
                         GL_RGB,GL_UNSIGNED_BYTE,introRgb.data());
+    }
+
+    void uploadBgVidFrame() {
+        if (!bgVid.nextVideoFrame(bgVidRgb.data())) return; // loopVideo handles restart
+        glBindTexture(GL_TEXTURE_2D,bgVidTex);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,bgVid.w,bgVid.h,
+                        GL_RGB,GL_UNSIGNED_BYTE,bgVidRgb.data());
     }
 
     void tickBg() {
@@ -743,7 +891,13 @@ struct App {
 
         title.load(progText);
 
-        if (!introVid.open("vids/splice/intro.mp4",true)) return false;
+        // Title audio (looping background music)
+        if (titleAudio.open("audios/trimmedsong.m4a",true))
+            titleAudio.preDecodeAudio();
+        else
+            std::cerr<<"[audio] trimmedsong.m4a not found\n";
+
+        if (!introVid.open("vids/splice/new_intro.mp4",true)) return false;
         introTex=makeTex(introVid.w,introVid.h);
         introRgb.resize((size_t)introVid.w*introVid.h*3);
         if (introVid.vsi>=0) {
@@ -752,6 +906,26 @@ struct App {
         }
         introVid.preDecodeAudio();
 
+        // Background video (station.mp4, looping) — audio mixed in under walk SFX
+        if (!bgVid.open("vids/splice/station.mp4",true))
+            std::cerr<<"[bg] Cannot open station.mp4\n";
+        bgVid.loopVideo=true;
+        bgVid.preDecodeAudio();
+        if (bgVid.w>0 && bgVid.h>0) {
+            bgVidTex=makeTex(bgVid.w,bgVid.h);
+            bgVidRgb.resize((size_t)bgVid.w*bgVid.h*3);
+            if (bgVid.vsi>=0) {
+                AVRational r=bgVid.fmt->streams[bgVid.vsi]->avg_frame_rate;
+                if (r.num>0) bgVidFrameTime=(double)r.den/r.num;
+            }
+            // Prime first frame
+            bgVid.nextVideoFrame(bgVidRgb.data());
+            glBindTexture(GL_TEXTURE_2D,bgVidTex);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,bgVid.w,bgVid.h,
+                            GL_RGB,GL_UNSIGNED_BYTE,bgVidRgb.data());
+        }
+
+        // Background waves (now used as overlay, not primary bg)
         if (!seqBg.load("renders/background_waves_staggered"))
             std::cerr<<"[bg] No frames in renders/background_waves_staggered\n";
 
@@ -762,11 +936,17 @@ struct App {
         seqLeftFoot.load("renders/walk_right/left_foot");
         seqRightFoot.load("renders/walk_right/right_foot");
         seqShakeHead.load("renders/walk_right/shake_head");
+        seqTurnLeft.load("renders/walk_right/turn_left");
+
+        seqWLTurnRight.load("renders/walk_left/turn_right");
+        seqWLLeftFoot.load("renders/walk_left/left_foot");
+        seqWLRightFoot.load("renders/walk_left/right_foot");
+        seqWLShakeHead.load("renders/walk_left/shake_head");
 
         if (!walkClip.load("audios/walking.m4a"))
             std::cerr<<"[audio] walking.m4a not found\n";
 
-        mixer.vidSrc   = nullptr;        // silent during title screen
+        mixer.vidSrc   = &titleAudio;    // looping title music
         mixer.walkPcm  = &walkClip.pcm;
         mixer.walkPos  = &walkClip.pos;
         mixer.walkPlay = &walkClip.playing;
@@ -774,7 +954,7 @@ struct App {
         if (!mixer.init()) std::cerr<<"[audio] mixer init failed\n";
 
         double t0=glfwGetTime();
-        lastIntroTime=lastBgTime=lastSpriteTime=t0;
+        lastIntroTime=lastBgTime=lastBgVidTime=lastSpriteTime=t0;
         title.lastCharTime=title.cursorTimer=t0;
         return true;
     }
@@ -790,10 +970,12 @@ struct App {
             double now  = glfwGetTime();
             bool advI   = (now-lastIntroTime)  >= introFrameTime;
             bool advBg  = (now-lastBgTime)     >= bgFrameTime;
+            bool advBgV = (now-lastBgVidTime)  >= bgVidFrameTime;
             bool advS   = (now-lastSpriteTime) >= spriteFrameTime;
-            if (advI)  lastIntroTime  = now;
-            if (advBg) { lastBgTime   = now; tickBg(); tickOutro(); }
-            if (advS)  lastSpriteTime = now;
+            if (advI)   lastIntroTime  = now;
+            if (advBg)  { lastBgTime   = now; tickBg(); tickOutro(); }
+            if (advBgV) { lastBgVidTime = now; if (inGrassScene) uploadBgVidFrame(); }
+            if (advS)   lastSpriteTime = now;
 
             // ── State machine ─────────────────────────────────────────────────
             switch (appState) {
@@ -802,7 +984,7 @@ struct App {
                 title.update(now);
                 // Only accept key after typing finishes (prevents accidental skip)
                 if (anyKeyPressed && title.phase==TitleScreen::Phase::ELLIPSIS) {
-                    anyKeyPressed=false; rightKeyPressed=false;
+                    anyKeyPressed=false; rightKeyPressed=false; leftKeyPressed=false;
                     introVid.audioPos=0;
                     mixer.vidSrc=&introVid;   // start intro audio
                     uploadIntroFrame();        // prime first frame — no black flash
@@ -814,8 +996,9 @@ struct App {
             case AppState::INTRO:
                 if (advI) uploadIntroFrame();
                 if (introVid.eof || anyKeyPressed) {
-                    anyKeyPressed=false; rightKeyPressed=false;
-                    mixer.vidSrc=nullptr;     // stop intro audio
+                    anyKeyPressed=false; rightKeyPressed=false; leftKeyPressed=false;
+                    bgVid.audioPos=0;         // restart bg audio from top
+                    mixer.vidSrc=&bgVid;      // bg video audio takes over
                     appState=AppState::BACK_POSE;
                 }
                 break;
@@ -834,37 +1017,71 @@ struct App {
 
             case AppState::ENTERING_RIGHT:
                 if (advS) {
-                    if (seqEnterRight.loaded) {
-                        seqEnterRight.advance();
-                        if (seqEnterRight.done) {
+                    seqEnterRight.advance();
+                    if (seqEnterRight.done) {
                             stepCount=0; updateSpriteMatrix();
                             walkSub=WalkSub::IDLE; appState=AppState::WALKING_RIGHT;
                         }
-                    } else {
-                        // No enter_right renders — transition immediately
-                        stepCount=0; updateSpriteMatrix();
-                        walkSub=WalkSub::IDLE; appState=AppState::WALKING_RIGHT;
                     }
-                }
                 break;
 
             case AppState::WALKING_RIGHT:
                 if (rightKeyPressed) {
-                    rightKeyPressed=false;
-                    if (walkSub==WalkSub::IDLE) stepWalk();
+                    rightKeyPressed=false; leftKeyPressed=false;
+                    if(walkSub==WalkSub::IDLE){
+                    stepWalk();
+                    }
+                }
+                if (leftKeyPressed) {
+                    leftKeyPressed=false; rightKeyPressed=false;
+                    if(walkSub==WalkSub::IDLE){
+                        seq.reset();
+                        walkSub=WalkSub::TURN;
+                        appState=AppState::WALKING_LEFT;
+                    }
+                }
+                if (advS) {
+                    seq = advSeq();
+                    if (seq.done) onMoveComplete(); break;
+                }
+                break;
+
+            case AppState::WALKING_LEFT:
+                if (rightKeyPressed) {
+                    rightKeyPressed=false; leftKeyPressed=false;
+                    if (walkSub==WalkSub::IDLE) {
+                        appState=AppState::WALKING_RIGHT;
+                        walkSub==WalkSub::TURN;
+                        // updateSpriteMatrix(); // recalc with walk_right formula
+                        stepWalk();
+                    }
+                }
+                if (leftKeyPressed) {
+                    leftKeyPressed=false; rightKeyPressed=false;
+                    if (walkSub==WalkSub::IDLE) stepWalkLeft();
                 }
                 if (advS) {
                     switch (walkSub) {
                     case WalkSub::IDLE: break;
+                    case WalkSub::TURN_RIGHT:
+                        seqWLTurnRight.advance();
+                        if (seqWLTurnRight.done) {
+                            walkSub=WalkSub::IDLE;
+                            if (leftHeld()) stepWalkLeft();
+                        }
+                        break;
                     case WalkSub::LEFT_FOOT:
-                        seqLeftFoot.advance();
-                        if (seqLeftFoot.done)  onStepComplete(); break;
+                        seqWLLeftFoot.advance();
+                        if (seqWLLeftFoot.done) onStepCompleteLeft();
+                        break;
                     case WalkSub::RIGHT_FOOT:
-                        seqRightFoot.advance();
-                        if (seqRightFoot.done) onStepComplete(); break;
+                        seqWLRightFoot.advance();
+                        if (seqWLRightFoot.done) onStepCompleteLeft();
+                        break;
                     case WalkSub::SHAKE_HEAD:
-                        seqShakeHead.advance();
-                        if (seqShakeHead.done) onStepComplete(); break;
+                        seqWLShakeHead.advance();
+                        if (seqWLShakeHead.done) onStepCompleteLeft();
+                        break;
                     }
                 }
                 break;
@@ -883,15 +1100,19 @@ struct App {
                 glDisable(GL_BLEND);
                 if (appState==AppState::INTRO) {
                     drawTex(prog,quad,introTex);
-                } else if (appState==AppState::WALKING_RIGHT && seqOutro.loaded) {
-                    // Waves at 0.5 opacity, outro at full opacity on top
-                    drawTex(prog,quad,bgTex);                           // opaque base
-                    glEnable(GL_BLEND);
-                    drawTex(prog,quad,bgTex,  glm::mat4(1.f), 0.5f);   // waves dimmed
-                    drawTex(prog,quad,outroTex,glm::mat4(1.f), 1.0f);  // outro over
                 } else {
-                    drawTex(prog,quad,bgTex);
+                    // Primary background: looping video (station or grass)
+                    drawTex(prog,quad,bgVidTex);
                     glEnable(GL_BLEND);
+
+                    // Waves overlay at 0.5 alpha (when active)
+                    if (showWavesOverlay && bgTex)
+                        drawTex(prog,quad,bgTex,glm::mat4(1.f),0.5f);
+
+                    // Outro overlay if loaded
+                    if ((appState==AppState::WALKING_RIGHT||appState==AppState::WALKING_LEFT)
+                        && seqOutro.loaded && outroTex)
+                        drawTex(prog,quad,outroTex,glm::mat4(1.f),1.0f);
                 }
 
                 // ── Debug placeholder helper ──────────────────────────────────
@@ -923,14 +1144,36 @@ struct App {
                     switch (walkSub) {
                     case WalkSub::IDLE:
                         // Hold last frame of the most recently completed sequence
-                        if      (stepCount==0)                 tx=seqEnterRight.lastFrame();
-                        else if (stepCount>=cfg::MAX_CYCLES*2) tx=seqShakeHead.lastFrame();
+                        if      (stepCount==0)                 tx=seqLeftFoot.firstFrame();
                         else if ((stepCount%2)==0)             tx=seqRightFoot.lastFrame();
-                        else                                   tx=seqRightFoot.firstFrame();
+                        else                                   tx=seqLeftFoot.lastFrame();
                         break;
                     case WalkSub::LEFT_FOOT:   tx=seqLeftFoot.current();  break;
                     case WalkSub::RIGHT_FOOT:  tx=seqRightFoot.current(); break;
                     case WalkSub::SHAKE_HEAD:  tx=seqShakeHead.current(); break;
+                    // we switch before, so this is actually turning from walking left to walking right
+                    case WalkSub::TURN: tx=seqWLTurnRight.current(); break;
+                    default: break;
+                    }
+                    if (tx) drawTex(prog,quad,tx,spriteMatrix);
+                    else    drawPlaceholder({0.8f,0.5f,0.1f,0.5f},spriteMatrix);  // orange
+                    break;
+                }
+
+                case AppState::WALKING_LEFT: {
+                    GLuint tx=0;
+                    switch (walkSub) {
+                    case WalkSub::IDLE:
+                        // Hold last frame of the most recently completed sequence
+                        if      (stepCount==cfg::MAX_CYCLES)   tx=seqLeftFoot.firstFrame();
+                        else if ((stepCount%2)==0)             tx=seqRightFoot.lastFrame();
+                        else                                   tx=seqLeftFoot.lastFrame();
+                        break;
+                    // we switch before, so this is actually turning from walking left to walking right
+                    case WalkSub::TURN:  tx=seqTurnLeft.current(); break;
+                    case WalkSub::LEFT_FOOT:   tx=seqWLLeftFoot.current();  break;
+                    case WalkSub::RIGHT_FOOT:  tx=seqWLRightFoot.lastFrame(); break;
+                    case WalkSub::SHAKE_HEAD:  tx=seqWLShakeHead.current(); break;
                     }
                     if (tx) drawTex(prog,quad,tx,spriteMatrix);
                     else    drawPlaceholder({0.8f,0.5f,0.1f,0.5f},spriteMatrix);  // orange
