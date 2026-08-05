@@ -47,6 +47,8 @@ extern "C" {
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
+#include <mach-o/dyld.h>   // _NSGetExecutablePath, for locating the assets
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -315,7 +317,7 @@ static glm::mat4 rectMatrix(float x, float y, float w, float h) {
 // hand-drawn audience one nested level at a time (AUDIENCE_1..3). DOWN advances.
 enum class AppState { TITLE, INTRO, BACK_POSE, ENTERING_RIGHT,
                       WALKING_RIGHT, WALKING_LEFT,
-                      CENTERING, CENTER_HOLD,
+                      CENTER_SLIDE, CENTER_HOLD,
                       HAND_DRAWN, AUDIENCE_1, AUDIENCE_2, AUDIENCE_3,
                       OUTRO };
 enum class WalkSub  { IDLE, LEFT_FOOT, RIGHT_FOOT, SHAKE_HEAD, TURN};
@@ -353,43 +355,15 @@ void main(){
     frag = vec4(c.rgb, a);
 })glsl";
 
-// Hand-drawn "boil": jitter the UV lookup with low-frequency value noise so the
-// Blender sprite's clean vector lines wobble like ink. uBoilSeed is quantised to
-// BOIL_HZ so the drawing re-settles in discrete steps instead of sliding
-// smoothly — that stepping is what reads as hand-drawn. Amplitude is calibrated
-// against renders/man_noise: p90 line displacement there is ~1 px, max ~3 px on
-// a 522 px figure. 24×14 noise cells across the canvas ≈ 60 px cells on screen,
-// so the figure spans ~6 cells and bends coherently rather than dissolving.
-static const char* FS_BOIL = R"glsl(
-#version 330 core
-in vec2 vUV; out vec4 frag;
-uniform sampler2D uTex; uniform float uAlpha;
-uniform vec2  uBoilAmp;
-uniform float uBoilSeed;
-float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
-float vnoise(vec2 p){
-    vec2 i=floor(p), f=fract(p);
-    f=f*f*(3.0-2.0*f);
-    return mix(mix(hash(i),           hash(i+vec2(1,0)), f.x),
-               mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
-}
-void main(){
-    vec2 q = vUV * vec2(24.0, 14.0) + uBoilSeed;
-    vec2 d = (vec2(vnoise(q), vnoise(q + 37.0)) - 0.5) * 2.0 * uBoilAmp;
-    frag = texture(uTex, vUV + d);
-    frag.a *= uAlpha;
-})glsl";
-
 // Flat-tint line art that also boils. The man and the three audience levels
 // used to ship as 100-frame loops, but those frames were one drawing being
 // redrawn — ink sat a p90 of 1 px from frame 0 — so the wobble is generated
 // here instead and the assets are single stills (see boil_stills.py).
 //
-// Unlike FS_BOIL, the noise cell count is a uniform rather than a baked 24x14:
-// that constant assumed a full 1920x1080 canvas, and these stills are tight
-// crops crossing a range of on-screen sizes. drawBoiledTinted derives it from
-// the rect so cells stay near the calibrated ~60 screen px however big the
-// drawing lands. Noise helpers mirror FS_BOIL's — GLSL has no include.
+// The noise cell count is a uniform rather than a baked constant: these stills
+// are tight crops crossing a range of on-screen sizes, so drawBoiledTinted
+// derives it from the rect, keeping cells near the calibrated ~60 screen px
+// however big the drawing lands.
 static const char* FS_BOIL_TINT = R"glsl(
 #version 330 core
 in vec2 vUV; out vec4 frag;
@@ -443,6 +417,15 @@ static const char* FS_PLAIN = R"glsl(
 #version 330 core
 out vec4 frag; uniform vec4 uColor;
 void main(){ frag=uColor; })glsl";
+
+// Horizontal alpha gradient — uColor is the fill (black here); alpha ramps from
+// uLeftA at the screen's left edge to uRightA at the right. Uses VS_SRC so vUV.x
+// gives the 0→1 left-to-right position. Drives the audience depth-darkening.
+static const char* FS_HGRAD = R"glsl(
+#version 330 core
+in vec2 vUV; out vec4 frag;
+uniform vec3 uColor; uniform float uLeftA; uniform float uRightA;
+void main(){ frag = vec4(uColor, mix(uLeftA, uRightA, vUV.x)); })glsl";
 
 static GLuint compileShader(GLenum t, const char* src) {
     GLuint id = glCreateShader(t);
@@ -502,27 +485,10 @@ static void drawTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
     drawTex(prog, q, tex, M, alpha);
 }
 
-// drawTex through the boil shader. `spriteScale` is the sprite matrix's X
-// scale, needed to convert the desired screen-pixel wobble into UV units, and
-// `seed` should already be quantised to the boil cadence.
-static void drawBoiled(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
-                       float boilPx, float spriteScale, float seed,
-                       float alpha=1.f) {
-    if (!tex) return;
-    if (spriteScale <= 0.f) spriteScale = 1.f;
-    glUseProgram(prog);
-    glUniform2f(glGetUniformLocation(prog,"uBoilAmp"),
-                boilPx/((float)cfg::WIN_W*spriteScale),
-                boilPx/((float)cfg::WIN_H*spriteScale));
-    glUniform1f(glGetUniformLocation(prog,"uBoilSeed"), seed);
-    drawTex(prog, q, tex, M, alpha);
-}
-
 // drawTinted through the boil shader, for the rect-placed hand-drawn stills.
 // rectW/rectH are the drawing's on-screen size in pixels, which is all the
 // conversion needs here: a UV offset of d shifts the sampled point by d*rectW
-// screen px, so the amplitude is just boilPx over the rect. (drawBoiled instead
-// works in sprite-matrix units, where the quad always spans the full window.)
+// screen px, so the amplitude is just boilPx over the rect.
 // Cells are sized off the same rect to hold the calibrated ~60 px cell.
 static void drawBoiledTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
                              float rectW, float rectH, float boilPx, float seed,
@@ -1196,8 +1162,8 @@ struct App {
     GLuint      progOverlay = 0; // textured quad, alpha from uniform only
     GLuint      progText  = 0;   // font atlas
     GLuint      progPlain = 0;   // solid color debug
-    GLuint      progBoil  = 0;   // textured quad + hand-drawn line wobble
-    GLuint      progBoilTint = 0;// the same wobble, recoloured — hand-drawn stills
+    GLuint      progHGrad = 0;   // horizontal alpha gradient — audience darkening
+    GLuint      progBoilTint = 0;// hand-drawn line wobble, recoloured — the crowd
     GLuint      progTint  = 0;   // textured quad, alpha kept, colour replaced
     Quad        quad;
 
@@ -1322,33 +1288,33 @@ struct App {
     bool leftKeyPressed  = false;
     bool downKeyPressed  = false;
 
-    // CENTERING / OUTRO state
-    SpriteSeq seqCenter;          // 53-frame transition + idle pose
+    // CENTER_SLIDE / CENTER_HOLD / OUTRO state
     SpriteSeq seqSmoothBug;       // 301 RGBA frames — bug clip, played once in OUTRO
     SpriteSeq seqExit;            // exit/ frame sequence — final exit animation
-    bool      pendingCenter = false;   // set when DOWN pressed mid-step in WALKING_LEFT
-    int       centeringFrame = 0;
-    float     T_align_tx = 0.f, T_align_ty = 0.f;
-    float     Hg_lift_start_y = 0.f;   // snapshot for lift-decay during CENTERING
-    float     centerFirstX = 0.f, centerFirstY = 0.f;  // alpha-centroid X / bbox-bottom Y of center_sprite/0000
-    float     centerLastX  = 0.f, centerLastY  = 0.f;  // …of the LAST center_sprite frame (centered pose)
-    float     wavesAlpha = 0.5f;       // ramped 0.5 → 2.0 during CENTERING
+    bool      pendingCenter = false;   // set when DOWN pressed during a walk
+    // The centered man is one digital sprite (enter_right/0089) that replaces
+    // the old hand-drawn "standing man" from CENTER_HOLD all the way through the
+    // audience pull-back. manCentroidX/manBottomY are measured off it at load.
+    BoilStill manSprite;
+    // CENTER_SLIDE: a pure screen-space translate of manSprite from where the
+    // walk left him to screen-centre / feet-on-bottom. No scale, no fade.
+    double    slideStartTime = 0.0;
+    float     slideStartTx = 0.f, slideStartTy = 0.f;
+    float     slideEndTx   = 0.f, slideEndTy   = 0.f;
+    static constexpr double CENTER_SLIDE_SEC = 0.5;
+    float     wavesAlpha = 0.5f;       // 0.5 while walking; 2.0 as audience backdrop
     // The waves are treated as a backdrop that shares the camera move: they
-    // push in across CENTERING, then pull back in proportion with every
+    // push in at the hand-drawn cut, then pull back in proportion with every
     // zoom-out phase. WAVES_CENTER_ZOOM is chosen so that even at the widest
     // shot the scaled texture still covers the frame (1.5 × Z_D/Z_A ≈ 1.04),
     // which is what stops black edges creeping in at the borders.
     float     wavesScale = 1.f;
     static constexpr float WAVES_CENTER_ZOOM = 1.5f;
-    // Fade the scene video to black across CENTERING; 0 elsewhere, 1 once
-    // centering ends so the background stays black through the OUTRO.
-    float     blackAlpha = 0.f;
 
-    // OUTRO: begins on a key press from CENTER_HOLD (waves gone). The bug clip
-    // plays full-frame over black with the hand-drawn exit/ animation composited
-    // on top; the (quieter) exit voice recording plays underneath. Each clip
-    // plays through once then cuts to black. Runs until the recording finishes
-    // (outroEndTime), then quits.
+    // OUTRO: begins on a key press from AUDIENCE_3 (waves gone). The hand-drawn
+    // exit/ animation plays alone, centred on black, with the (quieter) exit
+    // voice recording underneath. It plays through once then cuts to black.
+    // Runs until the recording finishes (outroEndTime), then quits.
     double     lastOutroFrameTime = 0.0;   // bug-clip cadence timer
     double     lastExitFrameTime  = 0.0;   // exit-anim cadence timer
     double     exitFrameSec       = 1.0/24.0;  // set at exit start; see AUDIENCE_3
@@ -1370,7 +1336,7 @@ struct App {
     // stills now, boiled by FS_BOIL_TINT at the same 20 fps the loops ran at.
     // Splitting l3 once rather than per frame also stopped ink popping between
     // the two layers, which the per-frame blob labelling used to cause.
-    BoilStill stillMan, stillAudL1, stillAudL2, stillAudL3Back, stillAudL3Front;
+    BoilStill stillAudL1, stillAudL2, stillAudL3Back, stillAudL3Front;
     static constexpr double HAND_BOIL_HZ = 20.0;   // re-settle rate, was the loop cadence
     static constexpr float  HAND_BOIL_PX = 1.0f;   // p90 line displacement, measured
 
@@ -1385,10 +1351,13 @@ struct App {
     // a² - 2160a + 172800 = 0, giving a = 1080 + sqrt(993600).
     static constexpr float CAM_FOCAL_X    = -1116.796f;
     static constexpr float CAM_ZOOM_STEP  = 0.884434f;
-    // Man at Z=1 (the widest shot): centroid X 320, texture scale such that his
-    // figure is 1.15× the 367 px the digital sprite occupies at CENTER_HOLD.
+    // Man centroid X 320 at Z=1 (widest) → 960 at the tightest shot Z=stageZoom(0).
+    // MAN_WORLD_SCALE is 1/stageZoom(0), so at the tightest shot ms = Z*scale = 1:
+    // manSprite (a full 1920×1080 frame) then draws at native size, exactly
+    // matching the CENTER_SLIDE end pose, and shrinks from there as the crowd is
+    // revealed. stageZoom(0) = (1/CAM_ZOOM_STEP)^3 ≈ 1.44561.
     static constexpr float MAN_WORLD_X     = 320.0f;
-    static constexpr float MAN_WORLD_SCALE = 0.559300f;
+    static constexpr float MAN_WORLD_SCALE = 0.691748f;
     // Audience at Z=1: drawing's bottom-left corner at x=480, scaled so the
     // full level-3 crop spans 480 → 1920 (1440/1394).
     static constexpr float AUD_WORLD_X     = 480.0f;
@@ -1406,11 +1375,7 @@ struct App {
     float  stageT = 1.f;    // 0→1 progress of the move into `stage`
     double stageStartTime = 0.0;
     static constexpr double STAGE_XFADE_SEC = 1.2;   // zoom + cross-fade length
-    float  manCentroidX = 0.f, manBottomY = 0.f;     // renders/man_noise anchor
-
-    // Procedural boil on the digital sprite during CENTERING / CENTER_HOLD.
-    static constexpr float  BOIL_PX = 2.5f;   // peak wobble, screen pixels
-    static constexpr double BOIL_HZ = 12.0;   // re-settle rate
+    float  manCentroidX = 0.f, manBottomY = 0.f;     // manSprite feet anchor
 
     // The hand-drawn ink is black, which is invisible against the black these
     // phases run on — the audience is recoloured to a white outline at draw
@@ -1418,35 +1383,14 @@ struct App {
     glm::vec3 audTint{1.f, 1.f, 1.f};
 
     // ── Exit screen ──────────────────────────────────────────────────────────
-    // A "vignette sphere" — the backyard-tree drawing from the katias-stuff
-    // site, softly faded into a circle and ringed by the circle hand-drawn on
-    // the layout sketch — with the exit animation playing over it and the man
-    // standing to its right. The pair is centred and fills 3/4 of the screen.
-    // Built by exit_screen_assets.py; all three share one circle centre and
-    // radius on a square canvas, so one square rect places all of them.
-    GLuint texExitDisc = 0, texTreeClean = 0, texTreeNoise = 0, texRim = 0;
-    float  manFigX0 = 0.f, manFigY0 = 0.f, manFigX1 = 0.f, manFigY1 = 0.f;
+    // The exit animation alone, centred on the screen over plain black. Its
+    // drawn extent is measured off the last frame — the only one with the
+    // drawing fully in — so the size doesn't depend on the empty margins the
+    // 1920×1080 frames carry around it.
     float  exitBoxX0 = 0.f, exitBoxY0 = 0.f, exitBoxX1 = 0.f, exitBoxY1 = 0.f;
-    // The stack — exit text, then the sphere with the man beside it — is
-    // centred and half the screen tall. Its parts are fractions of that so the
-    // whole thing rescales from one number.
-    static constexpr float  EXIT_STACK_H    = 0.50f * (float)cfg::WIN_H;
-    static constexpr float  EXIT_ANIM_FRAC  = 0.18f;  // exit-text band / stack
-    static constexpr float  EXIT_VGAP_FRAC  = 0.04f;  // text→sphere gap / stack
-    static constexpr float  EXIT_MAN_FRAC   = 0.75f;  // man height / sphere Ø
-    static constexpr float  EXIT_GAP_FRAC   = 0.05f;  // sphere→man gap / sphere Ø
-    // Sphere is a white field with the tree dark on it; everything outside it
-    // stays black, and the man beside it stays white.
-    glm::vec3 exitInkTint{0.f, 0.f, 0.f};
-    // The site's `doodle-boil`: the noise twin flips through four (opacity,
-    // sub-pixel offset) states at 8 fps with steps(1), which reads as the line
-    // being redrawn rather than cross-fading. Offsets are CSS px, scaled up to
-    // stay visible at the sphere's on-screen size.
-    static constexpr double EXIT_BOIL_SEC = 0.5 / 4.0;
-    static constexpr float  EXIT_BOIL_OFF = 2.0f;
-    static constexpr float  kBoilAlpha[4] = { 0.9f,  0.3f,  1.0f, 0.5f };
-    static constexpr float  kBoilDX[4]    = { 0.0f,  0.7f, -0.6f, 0.4f };
-    static constexpr float  kBoilDY[4]    = { 0.0f, -0.6f,  0.5f, 0.7f };
+    // How much of the screen that extent fills; whichever axis binds first.
+    static constexpr float  EXIT_ANIM_H = 0.58f * (float)cfg::WIN_H;
+    static constexpr float  EXIT_ANIM_W = 0.70f * (float)cfg::WIN_W;
 
     // Bug overlay during AUDIENCE_3: rolled once a second, plays through once.
     bool   bugActive = false;
@@ -1592,9 +1536,9 @@ struct App {
         } else {
             memcpy(Hp, Hg_pixel, sizeof(Hp));
         }
-        // Walk_left frames are warped into walk_right space. CENTERING renders
-        // the center_sprite in its native space (Hg_pixel was rebuilt to
-        // absolute coordinates at the trigger).
+        // Walk_left frames are warped into walk_right space. CENTER_SLIDE runs
+        // in walk_right space too (the man has already turned right), so it needs
+        // no warp — just the translation-only Hg_pixel built for the slide.
         if (appState == AppState::WALKING_LEFT) {
             float Hp2[3][3];
             mat3Mul(Hp, hom::H_left_px_to_right, Hp2);
@@ -1655,43 +1599,84 @@ struct App {
         mixer.vidSrc = prev;
     }
 
-    // From WALKING_LEFT IDLE: kick off the center_sprite transition. Hg_pixel
-    // is rebuilt as a pure translation T_align so center_sprite[0] lands at the
-    // same screen-pixel position as the walk_left idle frame; the per-frame
-    // CENTERING update then linearly decays Hg_pixel and Hg_lift toward
-    // identity over the 53-frame sequence so the final pose is canonical.
-    void triggerCentering() {
-        float ix, iy;
-        idleFrameTexel(/*isLeft=*/true, ix, iy);
-        // Walk_left frames render through H_left_px_to_right, which is a pure
-        // translation in this codebase.
-        float wx = ix + hom::H_left_px_to_right[0][2];
-        float wy = iy + hom::H_left_px_to_right[1][2];
-        // Apply Hg_pixel via the full 3x3 form (cheap and correctness-preserving).
-        const float w = Hg_pixel[2][0]*wx + Hg_pixel[2][1]*wy + Hg_pixel[2][2];
-        const float vx = (Hg_pixel[0][0]*wx + Hg_pixel[0][1]*wy + Hg_pixel[0][2]) / w;
-        const float vy = (Hg_pixel[1][0]*wx + Hg_pixel[1][1]*wy + Hg_pixel[1][2]) / w;
-        T_align_tx = vx - centerFirstX;
-        T_align_ty = vy - centerFirstY;
-        Hg_lift_start_y = Hg_lift[1][2];
+    // Screen rect for the centred man at camera zoom Z. At the tightest shot
+    // (Z = stageZoom(0)) ms = 1, so manSprite draws at native full-frame size
+    // with his centroid at screen-centre X and his feet on the bottom — the same
+    // pose CENTER_SLIDE ends on. Wider shots shrink and drift him left with the
+    // rest of the world. Used for CENTER_HOLD and every audience level.
+    glm::mat4 manRectMatrix(float Z) const {
+        const float ms = Z * MAN_WORLD_SCALE;
+        const float mx = CAM_FOCAL_X + Z * (MAN_WORLD_X - CAM_FOCAL_X);
+        return rectMatrix(mx - ms*manCentroidX,
+                          (float)cfg::WIN_H - ms*manBottomY,
+                          ms*(float)manSprite.w, ms*(float)manSprite.h);
+    }
+
+    // DOWN → centre, from any pose. Facing right slides straight in; facing left
+    // first turns to the right (reusing the walk-turn machinery), and the slide
+    // fires when that turn lands back at IDLE. Returns true if it consumed the
+    // frame so the caller breaks out of the walk case.
+    bool startCentering(double now) {
+        if (appState == AppState::WALKING_RIGHT) { beginCenterSlide(now); return true; }
+        // Facing left: kick off a turn to the right, exactly like an opposite-key
+        // press, but leave pendingCenter set so the slide fires after the turn.
+        if (stepsInCycle == 1) memcpy(Hg_turn, hom::H_left_step_half, sizeof(Hg_turn));
+        else                   mat3SetIdentity(Hg_turn);
+        appState = AppState::WALKING_RIGHT;
+        walkSub  = WalkSub::TURN;
+        currentDir().turnIn->reset();
+        applyPreTurnAlignment(/*wasRight=*/false);
+        updateSpriteMatrix();
+        return true;
+    }
+
+    // Begin the pure translate to centre from WALKING_RIGHT IDLE. Snapshots where
+    // manSprite's centroid currently lands, then interpolates a translation-only
+    // sprite matrix to (screen-centre X, feet on bottom) over CENTER_SLIDE_SEC.
+    // No scale change, no fade — the live scene video stays under the waves.
+    void beginCenterSlide(double now) {
+        // Snapshot where the walk actually left the character — its idle centroid
+        // X and feet (bbox-bottom) Y — under the live transform (WALKING_RIGHT
+        // space here, no left warp). Anchoring the slide on THIS, not manSprite's
+        // own centroid, makes the frame swap to manSprite land his feet exactly
+        // where the walk pose stood, with no sideways jump.
+        float wx, wy;
+        idleFrameTexel(/*isLeft=*/false, wx, wy);
+        const float pw = Hg_pixel[2][0]*wx + Hg_pixel[2][1]*wy + Hg_pixel[2][2];
+        const float px = (Hg_pixel[0][0]*wx + Hg_pixel[0][1]*wy + Hg_pixel[0][2]) / pw;
+        const float py = (Hg_pixel[1][0]*wx + Hg_pixel[1][1]*wy + Hg_pixel[1][2]) / pw;
+        const float sx = Hg_lift[0][0]*px + Hg_lift[0][1]*py + Hg_lift[0][2];
+        const float sy = Hg_lift[1][0]*px + Hg_lift[1][1]*py + Hg_lift[1][2];
         mat3SetIdentity(Hg_pixel);
-        Hg_pixel[0][2] = T_align_tx;
-        Hg_pixel[1][2] = T_align_ty;
+        mat3SetIdentity(Hg_lift);
         mat3SetIdentity(Hg_turn);
-        seqCenter.reset();
-        centeringFrame = 0;
-        wavesAlpha = 0.5f;
-        blackAlpha = 0.f;          // scene video fades to black across CENTERING
+        slideStartTx = sx - manCentroidX;
+        slideStartTy = sy - manBottomY;
+        slideEndTx   = (float)cfg::WIN_W * 0.5f - manCentroidX;   // centroid → screen centre
+        slideEndTy   = (float)cfg::WIN_H        - manBottomY;     // feet → screen bottom
+        Hg_pixel[0][2] = slideStartTx;
+        Hg_pixel[1][2] = slideStartTy;
+        slideStartTime = now;
+        walkSub  = WalkSub::IDLE;
+        appState = AppState::CENTER_SLIDE;
+        pendingCenter = false;
+        anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
         walkClip.stop();
-        // Centered portion plays the title-screen track (scene bg audio hands off).
+        // Centred portion plays the title-screen track (scene bg audio hands off).
         titleAudio.audioPos = 0;
         mixer.vidSrc  = &titleAudio;
         mixer.vidSrc2 = nullptr;
         mixer.bgGain.store(1.0f);
-        walkSub  = WalkSub::IDLE;
-        appState = AppState::CENTERING;
-        anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
-        pendingCenter = false;
+    }
+
+    // Right-edge alpha of the audience darkness gradient at the current depth:
+    // it deepens each level (0 while the man is close, strongest at the widest
+    // crowd shot), eased across the zoom between levels.
+    float gradRightAlpha() const {
+        static const float GA[4] = { 0.f, 0.18f, 0.34f, 0.50f };  // per stage
+        const int   s0 = stage > 0 ? stage - 1 : 0;
+        const float tt = stageT * stageT * (3.f - 2.f * stageT);
+        return GA[s0] + (GA[stage] - GA[s0]) * tt;
     }
 
     // Drop every walk-cycle sprite sequence. Once the character has centred he
@@ -1738,8 +1723,9 @@ struct App {
     // span the whole voice recording, with everything else released.
     void beginOutro(double now) {
         seqExit.reset();
-        // The crowd and the bug are done; the man carries over — he stands
-        // beside the sphere on the exit screen.
+        // Nothing but the exit drawing is on screen from here, so the crowd,
+        // the bug and the man all go.
+        manSprite.unload();
         stillAudL1.unload(); stillAudL2.unload();
         stillAudL3Back.unload(); stillAudL3Front.unload();
         seqSmoothBug.unload();
@@ -1918,7 +1904,7 @@ struct App {
         progOverlay = makeProgram(VS_SRC,   FS_OVERLAY);
         progText    = makeProgram(VS_SRC,   FS_TEXT);
         progPlain   = makeProgram(VS_PLAIN, FS_PLAIN);
-        progBoil    = makeProgram(VS_SRC,   FS_BOIL);
+        progHGrad   = makeProgram(VS_SRC,   FS_HGRAD);
         progBoilTint= makeProgram(VS_SRC,   FS_BOIL_TINT);
         progTint    = makeProgram(VS_SRC,   FS_TINT);
         quad.init();
@@ -1998,45 +1984,19 @@ struct App {
         dirRight = { &seqLeftFoot,   &seqRightFoot,   &seqShakeHead,   &seqWLTurnRight, +1 };
         dirLeft  = { &seqWLLeftFoot, &seqWLRightFoot, &seqWLShakeHead, &seqTurnLeft,    -1 };
 
-        // Center transition + idle pose. Both ends are measured: the first frame
-        // anchors the transition in, and the LAST one is what the centered pose
-        // renders — its character extends much further down in the texture, so
-        // the end-state matrix must be anchored on it (not on frame 0) to keep
-        // the scaled feet flush with the bottom of the screen.
-        if (!seqCenter.loadVideo("renders/seq/center_sprite.mov",
-                                 /*wantAlpha=*/true, /*keepEnds=*/true))
-            std::cerr<<"[center] No frames in renders/seq/center_sprite.mov (run reencode.py)\n";
-        if (seqCenter.firstFrameRGBA.empty() ||
-            !computeAlphaCentroidBottomRGBA(seqCenter.firstFrameRGBA.data(),
-                                            seqCenter.texW, seqCenter.texH,
-                                            centerFirstX, centerFirstY)) {
-            std::cerr<<"[center] Failed to read first center_sprite centroid\n";
-            // Fallback: assume canonical screen center.
-            centerFirstX = (float)cfg::WIN_W * 0.5f;
-            centerFirstY = (float)cfg::WIN_H * 0.5f;
-        }
-        if (seqCenter.lastFrameRGBA.empty() ||
-            !computeAlphaCentroidBottomRGBA(seqCenter.lastFrameRGBA.data(),
-                                            seqCenter.texW, seqCenter.texH,
-                                            centerLastX, centerLastY)) {
-            std::cerr<<"[center] Failed to read last center_sprite centroid\n";
-            centerLastX = centerFirstX;
-            centerLastY = centerFirstY;
-        }
-        seqCenter.firstFrameRGBA = std::vector<uint8_t>();
-        seqCenter.lastFrameRGBA  = std::vector<uint8_t>();
-
-        // Hand-drawn pull-back stills, boiled at draw time. The man's anchor is
-        // measured the same way the walk sequences are — alpha centroid X +
-        // bbox-bottom Y — so he can be planted by his feet at any zoom, and it
-        // is measured on the still that actually gets drawn.
-        if (!stillMan.load("renders/stills/man.png"))
-            std::cerr<<"[hand] No renders/stills/man.png (run boil_stills.py)\n";
-        if (!computeAlphaCentroidBottom("renders/stills/man.png",
-                                        manCentroidX, manBottomY)) {
-            std::cerr<<"[hand] Failed to read stills/man.png centroid\n";
-            manCentroidX = stillMan.w * 0.5f;
-            manBottomY   = (float)stillMan.h;
+        // The centred man is a single digital sprite — the last frame of the
+        // enter-right walk-on, a canonical right-facing standing pose (its anchor
+        // matches R_IDLE_FIRST, so swapping to it from a walk idle is seamless).
+        // It replaces the old hand-drawn man from CENTER_HOLD through the whole
+        // audience pull-back, so it is loaded once and kept. Its anchor (alpha
+        // centroid X + bbox-bottom Y) plants it by the feet at any zoom.
+        static const char* kManSprite = "renders/enter_right/0089.png";
+        if (!manSprite.load(kManSprite))
+            std::cerr<<"[man] No "<<kManSprite<<"\n";
+        if (!computeAlphaCentroidBottom(kManSprite, manCentroidX, manBottomY)) {
+            std::cerr<<"[man] Failed to read "<<kManSprite<<" centroid\n";
+            manCentroidX = manSprite.w * 0.5f;
+            manBottomY   = (float)manSprite.h;
         }
         if (!stillAudL1.load("renders/stills/aud_l1.png"))
             std::cerr<<"[aud] No renders/stills/aud_l1.png (run boil_stills.py)\n";
@@ -2059,21 +2019,9 @@ struct App {
                                /*keepEnds=*/true))
             std::cerr<<"[exit] No frames in renders/seq/exit.mov (run reencode.py)\n";
 
-        // Exit-screen stills. The man's bbox lets him stand on a ground line
-        // rather than hang off his centroid; the exit animation's bbox is taken
-        // from its LAST frame, the only one with the drawing fully in.
-        texExitDisc  = loadTexture("renders/exit_screen/disc.png");
-        texTreeClean = loadTexture("renders/exit_screen/tree_clean.png");
-        texTreeNoise = loadTexture("renders/exit_screen/tree_noise.png");
-        texRim       = loadTexture("renders/exit_screen/rim.png");
-        if (!texExitDisc || !texTreeClean || !texRim)
-            std::cerr<<"[exit] Missing renders/exit_screen (run exit_screen_assets.py)\n";
-        if (!computeAlphaBBox("renders/stills/man.png",
-                              manFigX0, manFigY0, manFigX1, manFigY1)) {
-            std::cerr<<"[exit] Failed to measure stills/man.png bbox\n";
-            manFigX0 = 0.f; manFigY0 = 0.f;
-            manFigX1 = (float)stillMan.w; manFigY1 = (float)stillMan.h;
-        }
+        // The exit animation's bbox, taken from its LAST frame — the only one
+        // with the drawing fully in — so it can be sized and centred by what is
+        // actually drawn rather than by the frame.
         {
             if (seqExit.lastFrameRGBA.empty() ||
                 !computeAlphaBBoxRGBA(seqExit.lastFrameRGBA.data(),
@@ -2199,10 +2147,11 @@ struct App {
             case AppState::WALKING_RIGHT:
             case AppState::WALKING_LEFT: {
                 const bool isRight     = (appState==AppState::WALKING_RIGHT);
-                // DOWN ("back") in walk_left → defer to next IDLE then enter CENTERING.
-                // Always clear so a stale DOWN from walk_right can't bleed through.
+                // DOWN ("back") from either direction → defer to the next clean
+                // IDLE, then centre (startCentering: slide if facing right, turn
+                // to the right first if facing left).
                 if (downKeyPressed) {
-                    if (!isRight) pendingCenter = true;
+                    pendingCenter = true;
                     downKeyPressed = false;
                 }
                 const bool sameKey     = isRight ? rightKeyPressed : leftKeyPressed;
@@ -2214,7 +2163,7 @@ struct App {
                         // Auto-fire scene transition after step (MAX_CYCLES*2 + 1)
                         // — i.e., 13 steps — without waiting for another keypress.
                         if (isRight && atWalkEnd()) { doWalkEnd(); break; }
-                        if (pendingCenter && !isRight) { triggerCentering(); break; }
+                        if (pendingCenter) { startCentering(now); break; }
                         if (oppositeKey) {
                             rightKeyPressed = leftKeyPressed = false;
                             // Mid-pair turn (one foot stepped in current cycle):
@@ -2243,7 +2192,7 @@ struct App {
                 }
 
                 if (walkSub == WalkSub::IDLE) {
-                    if (pendingCenter && !isRight) { triggerCentering(); break; }
+                    if (pendingCenter) { startCentering(now); break; }
                     if (sameKey) {
                         rightKeyPressed = leftKeyPressed = false;
                         startStep();
@@ -2269,80 +2218,38 @@ struct App {
                 break;
             }
 
-            case AppState::CENTERING: {
-                if (advS) {
-                    seqCenter.advance();
-                    centeringFrame++;
-                    int N = (int)seqCenter.frames.size();
-                    float t = (N <= 1) ? 1.f : (float)centeringFrame / (float)(N - 1);
-                    if (t > 1.f) t = 1.f;
-                    // Lerp from initial (scale 1, T_align translation) to a
-                    // scaled, centered, bottom-anchored final state. The end
-                    // matrix sends the LAST center_sprite frame's centroid X
-                    // and bbox-bottom Y — i.e. where the character actually
-                    // stands at the end of the animation — to (screen center
-                    // X, screen bottom Y), scaled by CENTER_END_SCALE around
-                    // that anchor so the feet stay at the bottom of the screen.
-                    static constexpr float CENTER_END_SCALE = 0.75f;
-                    const float s = 1.f - t * (1.f - CENTER_END_SCALE);
-                    const float endTx = (float)cfg::WIN_W * 0.5f - CENTER_END_SCALE * centerLastX;
-                    const float endTy = (float)cfg::WIN_H        - CENTER_END_SCALE * centerLastY;
-                    Hg_pixel[0][0] = s;
-                    Hg_pixel[0][1] = 0.f;
-                    Hg_pixel[0][2] = (1.f - t) * T_align_tx + t * endTx;
-                    Hg_pixel[1][0] = 0.f;
-                    Hg_pixel[1][1] = s;
-                    Hg_pixel[1][2] = (1.f - t) * T_align_ty + t * endTy;
-                    Hg_pixel[2][0] = 0.f;
-                    Hg_pixel[2][1] = 0.f;
-                    Hg_pixel[2][2] = 1.f;
-                    Hg_lift[1][2]  = (1.f - t) * Hg_lift_start_y;
-                    wavesAlpha = 0.5f + 1.5f * t;
-                    blackAlpha = t;                 // scene video fades to black
-                    // Backdrop pushes in as the character settles.
-                    wavesScale = 1.f + t * (WAVES_CENTER_ZOOM - 1.f);
-                    if (seqCenter.done) {
-                        // Lock the final scaled, foot-on-screen-bottom matrix.
-                        Hg_pixel[0][0] = CENTER_END_SCALE;
-                        Hg_pixel[0][1] = 0.f;
-                        Hg_pixel[0][2] = endTx;
-                        Hg_pixel[1][0] = 0.f;
-                        Hg_pixel[1][1] = CENTER_END_SCALE;
-                        Hg_pixel[1][2] = endTy;
-                        Hg_pixel[2][0] = 0.f;
-                        Hg_pixel[2][1] = 0.f;
-                        Hg_pixel[2][2] = 1.f;
-                        mat3SetIdentity(Hg_lift);
-                        wavesAlpha = 2.0f;
-                        blackAlpha = 1.0f;          // background fully black now
-                        wavesScale = WAVES_CENTER_ZOOM;
-                        // Hold on the centered pose with the wave overlay still
-                        // running; wait for a key press before the exit. Clear
-                        // any keys pressed mid-turn so the hold isn't skipped.
-                        anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
-                        appState = AppState::CENTER_HOLD;
-                    }
+            case AppState::CENTER_SLIDE: {
+                // Pure translate: manSprite slides from where the walk left him
+                // to screen-centre X / feet on the screen bottom over
+                // CENTER_SLIDE_SEC. No scale change, no fade — the live scene
+                // video stays up under the waves the whole way.
+                float t = (float)((now - slideStartTime) / CENTER_SLIDE_SEC);
+                if (t > 1.f) t = 1.f;
+                const float e = t*t*(3.f - 2.f*t);      // smoothstep
+                Hg_pixel[0][2] = slideStartTx + (slideEndTx - slideStartTx) * e;
+                Hg_pixel[1][2] = slideStartTy + (slideEndTy - slideStartTy) * e;
+                if (t >= 1.f) {
+                    Hg_pixel[0][2] = slideEndTx;
+                    Hg_pixel[1][2] = slideEndTy;
+                    anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
+                    appState = AppState::CENTER_HOLD;
                 }
                 break;
             }
 
             case AppState::CENTER_HOLD: {
-                // Centered pose held over black while the waves keep looping.
-                // DOWN swaps the digital sprite for the hand-drawn one — same
-                // spot, standing taller — and begins the pull-back.
+                // Centred man held over the live scene + waves. DOWN begins the
+                // hand-drawn pull-back: the crowd fades up, a green wash lands as
+                // a hard cut, and the waves become the backdrop the camera pulls
+                // out of. The man carries on as the same digital sprite.
                 if (downKeyPressed) {
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
-                    // The digital walk/centre sprites are behind us for good.
-                    releaseWalkSequences();
-                    seqCenter.unload();
+                    releaseWalkSequences();     // the walk sprites are behind us
                     stage = 0;
-                    stageT = 1.f;              // straight swap, no zoom
+                    stageT = 1.f;               // start on the tightest shot (Z0)
                     stageStartTime = now;
-                    // Hard cut, not a fade: the scene video comes straight back
-                    // from under the black and the green wash lands with it, in
-                    // the same frame the sprite becomes hand-drawn.
-                    blackAlpha = 0.f;
-                    greenAlpha = GREEN_MAX;
+                    greenAlpha = GREEN_MAX;     // hard cut, not a fade
+                    wavesAlpha = 2.0f;          // waves become the audience backdrop
                     appState = AppState::HAND_DRAWN;
                 }
                 break;
@@ -2486,61 +2393,26 @@ struct App {
                 glEnable(GL_BLEND);
                 title.render();
             } else if (appState==AppState::OUTRO) {
-                // Tree sphere + man, centred and 3/4 of the screen tall, over
-                // plain black, with the exit animation playing across the
-                // sphere. The animation stops drawing the instant it has played
-                // through once — no freeze/hold — while the exit recording keeps
-                // playing underneath.
+                // The exit animation on its own: centred on the screen, scaled
+                // up to fill most of it, over plain black. It stops drawing the
+                // instant it has played through once — no freeze/hold — while
+                // the exit recording keeps playing underneath.
                 glClearColor(0,0,0,1);
                 glClear(GL_COLOR_BUFFER_BIT);
                 glEnable(GL_BLEND);
 
-                // Vertical stack: exit text, gap, then the sphere.
-                const float textH = EXIT_ANIM_FRAC * EXIT_STACK_H;
-                const float vgap  = EXIT_VGAP_FRAC * EXIT_STACK_H;
-                const float D     = EXIT_STACK_H - textH - vgap;   // sphere Ø
-                const float figH  = std::max(1.f, manFigY1 - manFigY0);
-                const float figW  = std::max(1.f, manFigX1 - manFigX0);
-                const float ms    = (EXIT_MAN_FRAC * D) / figH;    // man tex scale
-                const float manW  = ms * figW;
-                const float gap   = EXIT_GAP_FRAC * D;
-                // Centre the sphere+man block, and the stack as a whole.
-                const float blockW = D + gap + manW;
-                const float bx = ((float)cfg::WIN_W - blockW) * 0.5f;
-                const float sy = ((float)cfg::WIN_H - EXIT_STACK_H) * 0.5f
-                               + textH + vgap;                     // sphere top
-
-                // Sphere: white field, the tree dark on it, its noise twin
-                // boiled over that, then the drawn rim.
-                drawTinted(progTint,quad,texExitDisc,rectMatrix(bx,sy,D,D),audTint);
-                drawTinted(progTint,quad,texTreeClean,rectMatrix(bx,sy,D,D),exitInkTint);
-                const int st = (int)std::fmod(now / EXIT_BOIL_SEC, 4.0);
-                drawTinted(progTint,quad,texTreeNoise,
-                           rectMatrix(bx + kBoilDX[st]*EXIT_BOIL_OFF,
-                                      sy + kBoilDY[st]*EXIT_BOIL_OFF, D, D),
-                           exitInkTint, kBoilAlpha[st]);
-                drawTinted(progTint,quad,texRim,rectMatrix(bx,sy,D,D),exitInkTint);
-
-                // Man to the right, on the black, standing on the sphere's
-                // bottom edge — white so he reads against it.
-                if (stillMan.loaded) {
-                    const float mw = ms*stillMan.w, mh = ms*stillMan.h;
-                    drawBoiledTinted(progBoilTint,quad,stillMan.current(),
-                                     rectMatrix(bx + D + gap - ms*manFigX0,
-                                                sy + D      - ms*manFigY1, mw, mh),
-                                     mw, mh, HAND_BOIL_PX,
-                                     (float)std::floor(now*HAND_BOIL_HZ), audTint);
-                }
-
-                // Exit animation above the whole block, centred on it and sized
-                // off its drawn extent so the scaling doesn't depend on the
-                // frame's empty margins.
                 if (!seqExit.done) {
                     if (GLuint exTx = seqExit.current()) {
-                        const float es = textH / std::max(1.f, exitBoxY1 - exitBoxY0);
+                        // Fit the drawn extent to the screen budget, then place
+                        // the frame so that extent's centre is the screen's.
+                        const float bw = std::max(1.f, exitBoxX1 - exitBoxX0);
+                        const float bh = std::max(1.f, exitBoxY1 - exitBoxY0);
+                        const float es = std::min(EXIT_ANIM_W / bw, EXIT_ANIM_H / bh);
                         drawTex(prog, quad, exTx,
-                                rectMatrix(bx + blockW*0.5f - es*(exitBoxX0+exitBoxX1)*0.5f,
-                                           sy - vgap - textH - es*exitBoxY0,
+                                rectMatrix((float)cfg::WIN_W*0.5f
+                                             - es*(exitBoxX0+exitBoxX1)*0.5f,
+                                           (float)cfg::WIN_H*0.5f
+                                             - es*(exitBoxY0+exitBoxY1)*0.5f,
                                            es*(float)cfg::WIN_W, es*(float)cfg::WIN_H));
                     }
                 }
@@ -2556,35 +2428,21 @@ struct App {
                     drawTex(prog,quad,bgVidTex);
                     glEnable(GL_BLEND);
 
-                    // Fade the scene video to black. `blackAlpha` ramps 0→1
-                    // across CENTERING so the video disappears under the waves
-                    // while the character turns to face front. Drawn over the
-                    // video but under the waves overlay so the waves "remain".
-                    if (blackAlpha > 0.f) {
-                        glUseProgram(progPlain);
-                        glUniformMatrix4fv(glGetUniformLocation(progPlain,"uModel"),
-                                           1,GL_FALSE,glm::value_ptr(glm::mat4(1.f)));
-                        glm::vec4 black(0.f,0.f,0.f,blackAlpha);
-                        glUniform4fv(glGetUniformLocation(progPlain,"uColor"),
-                                     1,glm::value_ptr(black));
-                        quad.draw();
-                    }
-
-                    // Waves overlay — `wavesAlpha` ramps 0.5 (walking) → 2.0
-                    // (CENTERING end). progOverlay's threshold-amplify shader
-                    // saturates wave regions to fully opaque at 2.0 while
-                    // keeping the PNG's transparent regions transparent. Shown
-                    // during the centering turn and the CENTER_HOLD wait, but
-                    // NOT during the exit (the OUTRO) — that is clean black.
+                    // Waves overlay — `wavesAlpha` is 0.5 while walking / sliding
+                    // to centre, then 2.0 as the audience backdrop. progOverlay's
+                    // threshold-amplify shader saturates wave regions to fully
+                    // opaque at 2.0 while keeping the PNG's transparent regions
+                    // transparent. Shown from the slide through the whole audience
+                    // pull-back, but NOT during the exit (OUTRO) — that is clean black.
                     bool wavesActive = showWavesOverlay
-                        || appState==AppState::CENTERING
+                        || appState==AppState::CENTER_SLIDE
                         || appState==AppState::CENTER_HOLD
                         || appState==AppState::HAND_DRAWN
                         || appState==AppState::AUDIENCE_1
                         || appState==AppState::AUDIENCE_2
                         || appState==AppState::AUDIENCE_3;
-                    // Scaled about the screen centre: the backdrop pushes in
-                    // over CENTERING and pulls back with each zoom-out, in step
+                    // Scaled about the screen centre: the backdrop pushes in at
+                    // the hand-drawn cut and pulls back with each zoom-out, in step
                     // with the camera. wavesScale never drops below 1, so the
                     // texture always covers the frame.
                     if (wavesActive && bgTex) {
@@ -2622,22 +2480,17 @@ struct App {
                         drawPlaceholder({0.2f,0.8f,0.2f,0.4f},spriteMatrix);
                     break;
 
-                // The digital sprite picks up a hand-drawn line wobble as it
-                // turns to face front and holds, foreshadowing the swap to the
-                // actual hand-drawn sprite. Amplitude is in screen pixels, so
-                // it is divided by the sprite matrix's live X scale.
-                case AppState::CENTERING:
-                    if (seqCenter.loaded)
-                        drawBoiled(progBoil,quad,seqCenter.current(),spriteMatrix,
-                                   BOIL_PX,Hg_pixel[0][0],
-                                   (float)std::floor(now*BOIL_HZ));
+                // Slide: manSprite drawn by the live (translation-only) sprite
+                // matrix as it moves to centre.
+                case AppState::CENTER_SLIDE:
+                    drawTex(prog,quad,manSprite.current(),spriteMatrix);
                     break;
 
+                // Hold: draw manSprite through the camera model at the tightest
+                // shot (Z0) — identical pixels to the slide's end, and to the
+                // first HAND_DRAWN frame, so both transitions are seamless.
                 case AppState::CENTER_HOLD:
-                    if (seqCenter.loaded)
-                        drawBoiled(progBoil,quad,seqCenter.lastFrame(),spriteMatrix,
-                                   BOIL_PX,Hg_pixel[0][0],
-                                   (float)std::floor(now*BOIL_HZ));
+                    drawTex(prog,quad,manSprite.current(),manRectMatrix(stageZoom(0)));
                     break;
 
                 // ── Hand-drawn pull-back ─────────────────────────────────────
@@ -2674,20 +2527,27 @@ struct App {
                         drawAudience(stillAudL3Front, Z, t, now);
                     }
 
-                    // The man draws last: he is never occluded by the crowd. He
-                    // is his own black ink here, not recoloured like the crowd,
-                    // so the tint just restates what the still already carries.
-                    if (stillMan.loaded) {
-                        const float ms = Z * MAN_WORLD_SCALE;
-                        const float mx = CAM_FOCAL_X + Z * (MAN_WORLD_X - CAM_FOCAL_X);
-                        const float mw = ms*stillMan.w, mh = ms*stillMan.h;
-                        drawBoiledTinted(progBoilTint, quad, stillMan.current(),
-                                         rectMatrix(mx - ms*manCentroidX,
-                                                    (float)cfg::WIN_H - ms*manBottomY,
-                                                    mw, mh),
-                                         mw, mh, HAND_BOIL_PX,
-                                         (float)std::floor(now*HAND_BOIL_HZ),
-                                         glm::vec3(0.f));
+                    // The man draws last of the scene: never occluded by the
+                    // crowd. He is the same digital sprite as CENTER_HOLD, placed
+                    // through the camera model — native at the tightest shot,
+                    // shrinking with the zoom-out. Plain: no boil, no tint.
+                    if (manSprite.loaded)
+                        drawTex(prog, quad, manSprite.current(), manRectMatrix(Z));
+
+                    // Depth darkening: a black gradient, clear at the left edge
+                    // and darkest at the right, deepening with each audience level
+                    // (see gradRightAlpha). Over the whole scene, under the wash.
+                    {
+                        const float ra = gradRightAlpha();
+                        if (ra > 0.f) {
+                            glUseProgram(progHGrad);
+                            glUniformMatrix4fv(glGetUniformLocation(progHGrad,"uModel"),
+                                               1,GL_FALSE,glm::value_ptr(glm::mat4(1.f)));
+                            glUniform3f(glGetUniformLocation(progHGrad,"uColor"),0.f,0.f,0.f);
+                            glUniform1f(glGetUniformLocation(progHGrad,"uLeftA"),0.f);
+                            glUniform1f(glGetUniformLocation(progHGrad,"uRightA"),ra);
+                            quad.draw();
+                        }
                     }
                     break;
                 }
@@ -2742,7 +2602,30 @@ struct App {
     }
 };
 
+// Every asset path in here is relative, so the process has to start in the
+// project root. Finder launches apps with the cwd set to "/", and a terminal
+// launch inherits wherever you happen to be — so derive the root from the
+// executable's own location instead of trusting the cwd.
+//
+//   Anim.app/Contents/MacOS/anim  →  the folder holding Anim.app
+//   ./anim                        →  the folder holding anim
+//
+// which puts the root in both cases next to audios/, renders/ and vids/.
+static void chdirToAssetRoot() {
+    char buf[4096];
+    uint32_t n = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &n) != 0) return;   // path longer than buf
+    std::error_code ec;
+    fs::path dir = fs::canonical(fs::path(buf).parent_path(), ec);
+    if (ec) return;
+    if (dir.filename() == "MacOS" && dir.parent_path().filename() == "Contents")
+        dir = dir.parent_path().parent_path().parent_path();
+    fs::current_path(dir, ec);
+    if (ec) std::cerr<<"[init] Could not enter "<<dir<<": "<<ec.message()<<"\n";
+}
+
 int main() {
+    chdirToAssetRoot();
     App app;
     if (!app.init()) { std::cerr<<"Init failed.\n"; return 1; }
     app.run();
