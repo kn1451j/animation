@@ -45,6 +45,15 @@ FEATHER = 8         # px of vertical fade across the edge — just enough to
                     # antialias the curve; wider reads as a dark haze on the ground
 DARK = 10           # luma at or below this counts as masked-out black
 
+# Push the horizon up off the ants. The mask is a motion-isolation pass, so its
+# top edge lands exactly where ant motion stops being detected — which is to say
+# it runs through the topmost ants and cuts them in half. Measured: the trail's
+# per-column top is y 279 at the 5th percentile, while the raw curve reaches
+# y 478 at its lowest. Lifting by that difference clears the whole trail and
+# still leaves the ground below the title text, which ends around y 390 on
+# screen (the renderer draws this texture shifted down 345 px).
+EDGE_LIFT = 200
+
 
 def extract_source(n_frames):
     if os.path.isdir(TMP):
@@ -78,7 +87,8 @@ def stable_edge(masks):
     xs = np.arange(w)
     idx = np.interp(xs, xs[has], idx[has])             # nearest-fill the holes
     idx = ndimage.uniform_filter1d(idx, size=EDGE_SMOOTH, mode="nearest")
-    return ndimage.gaussian_filter1d(idx, sigma=EDGE_SMOOTH / 6.0, mode="nearest")
+    idx = ndimage.gaussian_filter1d(idx, sigma=EDGE_SMOOTH / 6.0, mode="nearest")
+    return np.maximum(idx - EDGE_LIFT, 0.0)
 
 
 def main():
@@ -110,7 +120,9 @@ def main():
             ys = np.arange(h)[:, None]
             t = np.clip((ys - (scaled[None, :] - FEATHER / 2.0)) / FEATHER, 0.0, 1.0)
             alpha = (t * t * (3.0 - 2.0 * t))[:, :, None]
-            print(f"edge y {scaled.min():.0f}-{scaled.max():.0f}, feather {FEATHER} px")
+            print(f"edge y {scaled.min():.0f}-{scaled.max():.0f} "
+                  f"(on screen {scaled.min()+345:.0f}-{scaled.max()+345:.0f}), "
+                  f"lift {EDGE_LIFT} px, feather {FEATHER} px")
 
         out = (src.astype(np.float32) * alpha).astype(np.uint8)
         Image.fromarray(out).save(os.path.join(OUT, name))
