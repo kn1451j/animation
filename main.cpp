@@ -49,7 +49,9 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -178,10 +180,8 @@ namespace align {
 // Read a PNG and compute its alpha-weighted centroid X plus bbox-bottom Y
 // (max y where alpha > threshold). Matches the convention used in the align::
 // namespace constants. Returns false on load failure.
-static bool computeAlphaCentroidBottom(const std::string& pngPath,
-                                       float& cx, float& by) {
-    int w, h, ch;
-    unsigned char* data = stbi_load(pngPath.c_str(), &w, &h, &ch, STBI_rgb_alpha);
+static bool computeAlphaCentroidBottomRGBA(const unsigned char* data, int w, int h,
+                                           float& cx, float& by) {
     if (!data) return false;
     double sumA = 0.0, sumAx = 0.0;
     int    maxY = 0;
@@ -196,20 +196,27 @@ static bool computeAlphaCentroidBottom(const std::string& pngPath,
             }
         }
     }
-    stbi_image_free(data);
     if (sumA <= 0.0) return false;
     cx = (float)(sumAx / sumA);
     by = (float)maxY;
     return true;
 }
 
+static bool computeAlphaCentroidBottom(const std::string& pngPath,
+                                       float& cx, float& by) {
+    int w, h, ch;
+    unsigned char* data = stbi_load(pngPath.c_str(), &w, &h, &ch, STBI_rgb_alpha);
+    if (!data) return false;
+    bool ok = computeAlphaCentroidBottomRGBA(data, w, h, cx, by);
+    stbi_image_free(data);
+    return ok;
+}
+
 // Alpha bounding box of a PNG, in texels. Needed wherever art has to be placed
 // by an edge rather than by its centroid — the exit screen stands the man on a
 // ground line and centres the exit animation on the sphere.
-static bool computeAlphaBBox(const std::string& pngPath,
-                             float& x0, float& y0, float& x1, float& y1) {
-    int w, h, ch;
-    unsigned char* data = stbi_load(pngPath.c_str(), &w, &h, &ch, STBI_rgb_alpha);
+static bool computeAlphaBBoxRGBA(const unsigned char* data, int w, int h,
+                                 float& x0, float& y0, float& x1, float& y1) {
     if (!data) return false;
     int minX = w, minY = h, maxX = -1, maxY = -1;
     const int thresh = 16;
@@ -221,25 +228,19 @@ static bool computeAlphaBBox(const std::string& pngPath,
                 if (y < minY) minY = y;
                 if (y > maxY) maxY = y;
             }
-    stbi_image_free(data);
     if (maxX < 0) return false;
     x0 = (float)minX; y0 = (float)minY; x1 = (float)maxX; y1 = (float)maxY;
     return true;
 }
 
-// Lexicographically-last .png in a directory (skipping macOS AppleDouble
-// files), matching how SpriteSeq::load orders its frames — so this names the
-// same image the sequence ends on.
-static std::string lastPngIn(const std::string& dir) {
-    std::string best;
-    if (!fs::exists(dir)) return best;
-    for (auto& e : fs::directory_iterator(dir)) {
-        auto fn = e.path().filename().string();
-        if (e.path().extension() != ".png" || fn.substr(0,2) == "._") continue;
-        if (best.empty() || fn > fs::path(best).filename().string())
-            best = e.path().string();
-    }
-    return best;
+static bool computeAlphaBBox(const std::string& pngPath,
+                             float& x0, float& y0, float& x1, float& y1) {
+    int w, h, ch;
+    unsigned char* data = stbi_load(pngPath.c_str(), &w, &h, &ch, STBI_rgb_alpha);
+    if (!data) return false;
+    bool ok = computeAlphaBBoxRGBA(data, w, h, x0, y0, x1, y1);
+    stbi_image_free(data);
+    return ok;
 }
 
 // Single RGBA texture from a PNG, same filtering as SpriteSeq's frames.
@@ -816,6 +817,12 @@ struct VideoDecoder {
     int vsi=-1, asi=-1, w=0, h=0;
     bool eof = false;
     bool loopVideo = false;
+    // Output pixel format for nextVideoFrame(). The .mp4 backgrounds are opaque
+    // and go out as RGB24; the re-encoded sprite sequences carry a real alpha
+    // channel and go out as RGBA. Bytes-per-pixel has to track it because
+    // sws_scale needs the destination stride.
+    AVPixelFormat outFmt = AV_PIX_FMT_RGB24;
+    int           outBpp = 3;
 
     std::vector<float>  audioBuf;
     std::atomic<size_t> audioPos{0};
@@ -849,7 +856,9 @@ struct VideoDecoder {
         std::cerr<<"[audio] preDecodeAudio: "<<audioBuf.size()<<" samples\n";
     }
 
-    bool open(const std::string& path, bool wantAudio=true) {
+    bool open(const std::string& path, bool wantAudio=true, bool wantAlpha=false) {
+        outFmt = wantAlpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        outBpp = wantAlpha ? 4 : 3;
         if (avformat_open_input(&fmt,path.c_str(),nullptr,nullptr)<0) {
             std::cerr<<"[video] Cannot open: "<<path<<"\n"; return false;
         }
@@ -865,7 +874,7 @@ struct VideoDecoder {
             avcodec_parameters_to_context(vctx,fmt->streams[vsi]->codecpar);
             avcodec_open2(vctx,vc,nullptr);
             w=vctx->width; h=vctx->height;
-            sws=sws_getContext(w,h,vctx->pix_fmt,w,h,AV_PIX_FMT_RGB24,
+            sws=sws_getContext(w,h,vctx->pix_fmt,w,h,outFmt,
                                SWS_BILINEAR,nullptr,nullptr,nullptr);
         }
         if (wantAudio&&asi>=0) {
@@ -888,25 +897,35 @@ struct VideoDecoder {
         eof=false;
     }
 
+    // Pull frames until the decoder is genuinely empty, not just until the file
+    // runs out of packets. h264 reorders, so it holds several frames inside its
+    // pipeline; reading a packet at a time and taking whatever falls out loses
+    // however many were still in flight at EOF — it silently truncated the ants
+    // sequence from 123 frames to 121. Feeding a null packet puts the decoder in
+    // draining mode so the tail comes out too. (Intra-only codecs like qtrle
+    // have no delay, which is why only the h264 sequence ever showed it.)
     bool nextVideoFrame(uint8_t* dst) {
-        while (!eof) {
-            int ret=av_read_frame(fmt,pkt);
-            if (ret<0){
-                if (loopVideo){ seekToStart(); continue; }
-                eof=true; break;
+        if (!vctx) return false;
+        for (;;) {
+            int ret=avcodec_receive_frame(vctx,frm);
+            if (ret==0) {
+                uint8_t* dp[1]={dst}; int ls[1]={w*outBpp};
+                sws_scale(sws,frm->data,frm->linesize,0,h,dp,ls);
+                return true;
             }
-            if (pkt->stream_index==vsi&&vctx) {
-                avcodec_send_packet(vctx,pkt);
-                ret=avcodec_receive_frame(vctx,frm);
-                av_packet_unref(pkt);
-                if (ret==0) {
-                    uint8_t* dp[1]={dst}; int ls[1]={w*3};
-                    sws_scale(sws,frm->data,frm->linesize,0,h,dp,ls);
-                    return true;
-                }
-            } else { av_packet_unref(pkt); }
+            if (ret!=AVERROR(EAGAIN)) return false;   // AVERROR_EOF or a real error
+            if (eof) return false;
+
+            ret=av_read_frame(fmt,pkt);
+            if (ret<0) {
+                if (loopVideo){ seekToStart(); continue; }
+                avcodec_send_packet(vctx,nullptr);    // start draining
+                eof=true;
+                continue;
+            }
+            if (pkt->stream_index==vsi) avcodec_send_packet(vctx,pkt);
+            av_packet_unref(pkt);
         }
-        return false;
     }
 
     void close() {
@@ -934,7 +953,22 @@ struct SpriteSeq {
     // them, which requires knowing their size.
     int  texW=0, texH=0;
 
+    // Wall-clock of the last load()/loadVideo(), so the startup cost can be
+    // attributed to a sequence instead of guessed at. Run with ANIM_TIMING=1 to
+    // see the per-sequence breakdown; the total always prints.
+    long long loadMs = 0;
+    static bool timingOn() {
+        static const bool on = std::getenv("ANIM_TIMING") != nullptr;
+        return on;
+    }
+    void reportLoad(const std::string& src, const char* kind) const {
+        if (timingOn())
+            std::cerr<<"[load] "<<src<<"  "<<frames.size()<<' '<<kind
+                     <<"  "<<loadMs<<" ms\n";
+    }
+
     bool load(const std::string& dir) {
+        const auto t0 = std::chrono::steady_clock::now();
         if (!fs::exists(dir)){std::cerr<<"[sprite] Dir not found: "<<dir<<"\n";return false;}
         std::vector<fs::path> paths;
         for (auto& e:fs::directory_iterator(dir)) {
@@ -961,6 +995,78 @@ struct SpriteSeq {
             frames.push_back(t);
         }
         cur=0; done=false; loaded=!frames.empty();
+        loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now()-t0).count();
+        reportLoad(dir, "png");
+        return loaded;
+    }
+
+    // Decode a re-encoded sequence into the same texture list load() builds.
+    // Every frame still lands on the GPU before init() returns — this is not
+    // streaming, it is the same eager load with a faster front end. A PNG frame
+    // costs ~36 ms through stb_image at -O2; the same frame out of a video
+    // stream costs ~1 ms, and that gap is most of the startup wait.
+    //
+    // wantAlpha=false is for sequences that are opaque everywhere (the alpha
+    // channel would be a wasted quarter of the file); the upload still fills
+    // alpha with 255 so the shaders sample the same RGBA they always did.
+    // Pixels of the first and last decoded frames, kept only when asked for.
+    // Two sequences are measured at startup to place them — the exit screen
+    // sizes itself off its last frame, the centre sprite off both ends — and
+    // those measurements should come from the sequence that actually plays
+    // rather than from a PNG directory the video was supposed to replace.
+    // Freed by the caller once measured; they are ~8 MB each.
+    std::vector<uint8_t> firstFrameRGBA, lastFrameRGBA;
+
+    bool loadVideo(const std::string& path, bool wantAlpha=true,
+                   bool keepEnds=false) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!fs::exists(path)) {
+            std::cerr<<"[sprite] Video not found: "<<path<<"\n"; return false;
+        }
+        VideoDecoder dec;
+        if (!dec.open(path,/*wantAudio=*/false,wantAlpha)) return false;
+        if (dec.vsi<0 || dec.w<=0 || dec.h<=0) {
+            std::cerr<<"[sprite] No video stream in "<<path<<"\n";
+            dec.close(); return false;
+        }
+        texW=dec.w; texH=dec.h;
+
+        const size_t px  = (size_t)dec.w*dec.h;
+        std::vector<uint8_t> buf(px*dec.outBpp);
+        std::vector<uint8_t> rgba;
+        if (!wantAlpha) rgba.resize(px*4, 255);
+
+        while (dec.nextVideoFrame(buf.data())) {
+            const uint8_t* src=buf.data();
+            if (!wantAlpha) {                       // RGB24 -> RGBA, alpha=255
+                for (size_t i=0;i<px;++i) {
+                    rgba[i*4+0]=buf[i*3+0];
+                    rgba[i*4+1]=buf[i*3+1];
+                    rgba[i*4+2]=buf[i*3+2];
+                }
+                src=rgba.data();
+            }
+            GLuint t; glGenTextures(1,&t);
+            glBindTexture(GL_TEXTURE_2D,t);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,dec.w,dec.h,0,
+                         GL_RGBA,GL_UNSIGNED_BYTE,src);
+            frames.push_back(t);
+            if (keepEnds) {
+                if (frames.size()==1) firstFrameRGBA.assign(src, src+px*4);
+                lastFrameRGBA.assign(src, src+px*4);
+            }
+        }
+        dec.close();
+        cur=0; done=false; loaded=!frames.empty();
+        loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now()-t0).count();
+        reportLoad(path, "vid");
+        if (!loaded) std::cerr<<"[sprite] No frames decoded from "<<path<<"\n";
         return loaded;
     }
 
@@ -1793,6 +1899,7 @@ struct App {
 
     // ── Init ─────────────────────────────────────────────────────────────────
     bool init() {
+        const auto initT0 = std::chrono::steady_clock::now();
         glfwInit();
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
@@ -1862,62 +1969,62 @@ struct App {
         }
 
         // Background waves (now used as overlay, not primary bg)
-        if (!seqBg.load("renders/background_waves_staggered"))
-            std::cerr<<"[bg] No frames in renders/background_waves_staggered\n";
+        if (!seqBg.loadVideo("renders/seq/waves.mov"))
+            std::cerr<<"[bg] No frames in renders/seq/waves.mov (run reencode.py)\n";
 
         // Title-screen ant frames, looped beneath the terminal text. Generated
         // by ants_smooth.py: the isolation pass's wavy top edge, smoothed and
         // feathered, with the original footage filling everything below it.
-        if (!seqAnts.load("renders/ants_smooth"))
-            std::cerr<<"[title] No ant frames in renders/ants_smooth (run ants_smooth.py)\n";
+        // Opaque everywhere, so it ships without an alpha channel: 329 MB of PNGs
+        // becomes a 17 MB h264. This is the one sequence that is footage rather
+        // than drawing, and lossy is deliberate — see reencode.py.
+        if (!seqAnts.loadVideo("renders/seq/ants_smooth.mp4",/*wantAlpha=*/false))
+            std::cerr<<"[title] No ant frames in renders/seq/ants_smooth.mp4 (run reencode.py)\n";
 
-        seqBackPose.load("renders/back_pose");
-        seqEnterRight.load("renders/enter_right");
-        seqLeftFoot.load("renders/walk_right/left_foot");
-        seqRightFoot.load("renders/walk_right/right_foot");
-        seqShakeHead.load("renders/walk_right/shake_head");
-        seqTurnLeft.load("renders/walk_left/turn_left");
+        // Walk/turn/pose sprites. All lossless qtrle — they are ~99% empty, so
+        // RLE takes them to about a third of the PNGs and a tenth of the decode.
+        seqBackPose.load("renders/back_pose");          // single frame, stays a PNG
+        seqEnterRight.loadVideo("renders/seq/enter_right.mov");
+        seqLeftFoot.loadVideo("renders/seq/walk_right_left_foot.mov");
+        seqRightFoot.loadVideo("renders/seq/walk_right_right_foot.mov");
+        seqShakeHead.loadVideo("renders/seq/walk_right_shake_head.mov");
+        seqTurnLeft.loadVideo("renders/seq/walk_left_turn_left.mov");
 
-        seqWLTurnRight.load("renders/walk_right/turn_right");
-        seqWLLeftFoot.load("renders/walk_left/left_foot");
-        seqWLRightFoot.load("renders/walk_left/right_foot");
-        seqWLShakeHead.load("renders/walk_left/shake_head");
+        seqWLTurnRight.loadVideo("renders/seq/walk_right_turn_right.mov");
+        seqWLLeftFoot.loadVideo("renders/seq/walk_left_left_foot.mov");
+        seqWLRightFoot.loadVideo("renders/seq/walk_left_right_foot.mov");
+        seqWLShakeHead.loadVideo("renders/seq/walk_left_shake_head.mov");
 
         dirRight = { &seqLeftFoot,   &seqRightFoot,   &seqShakeHead,   &seqWLTurnRight, +1 };
         dirLeft  = { &seqWLLeftFoot, &seqWLRightFoot, &seqWLShakeHead, &seqTurnLeft,    -1 };
 
-        // Center transition + idle pose
-        if (!seqCenter.load("renders/center_sprite"))
-            std::cerr<<"[center] No frames in renders/center_sprite\n";
-        if (!computeAlphaCentroidBottom("renders/center_sprite/0000.png",
-                                        centerFirstX, centerFirstY)) {
-            std::cerr<<"[center] Failed to read center_sprite/0000.png centroid\n";
+        // Center transition + idle pose. Both ends are measured: the first frame
+        // anchors the transition in, and the LAST one is what the centered pose
+        // renders — its character extends much further down in the texture, so
+        // the end-state matrix must be anchored on it (not on frame 0) to keep
+        // the scaled feet flush with the bottom of the screen.
+        if (!seqCenter.loadVideo("renders/seq/center_sprite.mov",
+                                 /*wantAlpha=*/true, /*keepEnds=*/true))
+            std::cerr<<"[center] No frames in renders/seq/center_sprite.mov (run reencode.py)\n";
+        if (seqCenter.firstFrameRGBA.empty() ||
+            !computeAlphaCentroidBottomRGBA(seqCenter.firstFrameRGBA.data(),
+                                            seqCenter.texW, seqCenter.texH,
+                                            centerFirstX, centerFirstY)) {
+            std::cerr<<"[center] Failed to read first center_sprite centroid\n";
             // Fallback: assume canonical screen center.
             centerFirstX = (float)cfg::WIN_W * 0.5f;
             centerFirstY = (float)cfg::WIN_H * 0.5f;
         }
-        // Find and measure the LAST center_sprite frame — that's what the
-        // centered pose renders, and its character extends much further
-        // down in the texture than the first frame, so the end-state matrix
-        // must be anchored on it (not on frame 0) to keep the scaled feet
-        // flush with the bottom of the screen.
-        {
-            std::string lastPath;
-            for (auto& e : fs::directory_iterator("renders/center_sprite")) {
-                auto fn = e.path().filename().string();
-                if (e.path().extension() == ".png" && fn.substr(0,2) != "._") {
-                    if (lastPath.empty() ||
-                        fn > fs::path(lastPath).filename().string())
-                        lastPath = e.path().string();
-                }
-            }
-            if (lastPath.empty() ||
-                !computeAlphaCentroidBottom(lastPath, centerLastX, centerLastY)) {
-                std::cerr<<"[center] Failed to read last center_sprite centroid\n";
-                centerLastX = centerFirstX;
-                centerLastY = centerFirstY;
-            }
+        if (seqCenter.lastFrameRGBA.empty() ||
+            !computeAlphaCentroidBottomRGBA(seqCenter.lastFrameRGBA.data(),
+                                            seqCenter.texW, seqCenter.texH,
+                                            centerLastX, centerLastY)) {
+            std::cerr<<"[center] Failed to read last center_sprite centroid\n";
+            centerLastX = centerFirstX;
+            centerLastY = centerFirstY;
         }
+        seqCenter.firstFrameRGBA = std::vector<uint8_t>();
+        seqCenter.lastFrameRGBA  = std::vector<uint8_t>();
 
         // Hand-drawn pull-back stills, boiled at draw time. The man's anchor is
         // measured the same way the walk sequences are — alpha centroid X +
@@ -1940,13 +2047,17 @@ struct App {
         if (!stillAudL3Front.load("renders/stills/aud_l3_front.png"))
             std::cerr<<"[aud] No renders/stills/aud_l3_front.png (run boil_stills.py)\n";
 
-        // Bug clip frames (smooth_bug PNG sequence) — played during AUDIENCE_3.
-        if (!seqSmoothBug.load("vids/moving_objects/bug/smooth_bug"))
-            std::cerr<<"[bug] No frames in vids/moving_objects/bug/smooth_bug\n";
+        // Bug clip frames — played during AUDIENCE_3. Still the full 1920×1080
+        // frame, so BUG_CONTENT_* below stay valid.
+        if (!seqSmoothBug.loadVideo("renders/seq/smooth_bug.mov"))
+            std::cerr<<"[bug] No frames in renders/seq/smooth_bug.mov (run reencode.py)\n";
 
-        // Exit animation frames (exit/ PNG sequence) — the final outro screen.
-        if (!seqExit.load("exit"))
-            std::cerr<<"[exit] No frames in exit/\n";
+        // Exit animation frames — the final outro screen. qtrle is bit-exact, so
+        // this is the same pixels the PNGs held, at ~1 ms a frame instead of 36.
+        // keepLastFrame because the bbox below is measured off the final frame.
+        if (!seqExit.loadVideo("renders/seq/exit.mov",/*wantAlpha=*/true,
+                               /*keepEnds=*/true))
+            std::cerr<<"[exit] No frames in renders/seq/exit.mov (run reencode.py)\n";
 
         // Exit-screen stills. The man's bbox lets him stand on a ground line
         // rather than hang off his centroid; the exit animation's bbox is taken
@@ -1964,13 +2075,16 @@ struct App {
             manFigX1 = (float)stillMan.w; manFigY1 = (float)stillMan.h;
         }
         {
-            const std::string lastExit = lastPngIn("exit");
-            if (lastExit.empty() ||
-                !computeAlphaBBox(lastExit, exitBoxX0, exitBoxY0, exitBoxX1, exitBoxY1)) {
-                std::cerr<<"[exit] Failed to measure exit/ bbox\n";
+            if (seqExit.lastFrameRGBA.empty() ||
+                !computeAlphaBBoxRGBA(seqExit.lastFrameRGBA.data(),
+                                      seqExit.texW, seqExit.texH,
+                                      exitBoxX0, exitBoxY0, exitBoxX1, exitBoxY1)) {
+                std::cerr<<"[exit] Failed to measure exit bbox\n";
                 exitBoxX0 = 0.f; exitBoxY0 = 0.f;
                 exitBoxX1 = (float)cfg::WIN_W; exitBoxY1 = (float)cfg::WIN_H;
             }
+            seqExit.firstFrameRGBA = std::vector<uint8_t>();  // ~8 MB each,
+            seqExit.lastFrameRGBA  = std::vector<uint8_t>();  // done with them
         }
 
         if (!walkClip.load("audios/walking.m4a"))
@@ -1982,6 +2096,11 @@ struct App {
         mixer.walkPlay = &walkClip.playing;
         mixer.walkLoop = &walkClip.looping;
         if (!mixer.init()) std::cerr<<"[audio] mixer init failed\n";
+
+        std::cerr<<"[init] ready in "
+                 <<std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now()-initT0).count()
+                 <<" ms\n";
 
         double t0=glfwGetTime();
         lastIntroTime=lastBgTime=lastBgVidTime=lastSpriteTime=lastAntTime=t0;
