@@ -1,31 +1,28 @@
 """
 Rebuild the title-screen ant frames with a smooth top edge and no bottom gap.
 
-vids/moving_objects/ants/filter/ is the motion-isolated footage: a wavy band of
-forest floor with black above AND below it. The title draws it shifted down so
-the lower black is pushed off-screen, but the band's bottom edge sits at
-y 633-815 — above the shifted screen bottom on the left and centre — which
-leaves a black gap along the bottom of the terminal.
+vids/moving_objects/ants/filter/ is the motion-isolated footage the title used
+to draw: a wavy band of forest floor with black above AND below it. The title
+draws it shifted down so the lower black is pushed off-screen, but the band's
+bottom edge sits at y 633-815 — above the shifted screen bottom on the left and
+centre — which leaves a black gap along the bottom of the terminal.
 
-This regenerates the sequence from the unmasked source clip, keeping only the
-band's TOP edge as a mask and filling everything beneath it with the original
-footage. The edge is smoothed hard along x (the raw per-column boundary is
-jagged from the isolation pass) and feathered vertically, so it reads as a
-round horizon rather than a cut.
+This regenerates the sequence from the unmasked source clip, fading it out along
+a horizon of our own rather than the mask's. The mask is not used at all now: it
+was a motion-isolation pass, so its top edge landed exactly where ant motion
+stopped registering — which is to say it ran through the topmost ants and cut
+them in half, and it was lumpy and unstable frame to frame besides. A plain arc
+is both cleaner and entirely under our control.
 
-The edge is computed ONCE for the whole sequence, not per frame. The camera is
-locked off, so the horizon has no business moving — but the isolation pass drops
-and regains whole regions between frames, which swung the per-frame edge by up
-to 180 px in a single step and read as a flicker. Taking the per-column median
-across every frame throws those dropouts out and leaves the shape they agree on.
-Nothing is lost by fixing it: the pixels below the edge come from the unmasked
-clip either way, so the mask only ever chose where to stop.
+The horizon never moves, so there is nothing to flicker, and it is drawn well
+above the ant trail (whose per-column top measures y 279 at the 5th percentile)
+so no ant is ever sliced by it.
 
 Output is RGB on black, matching what SpriteSeq/the title renderer expect — the
 title draws ants with blending off, so the black simply stays black.
 
 Usage:  python3 ants_smooth.py         (from the repo root)
-Needs:  pillow numpy scipy, ffmpeg on PATH
+Needs:  pillow numpy, ffmpeg on PATH
 """
 
 import os
@@ -33,96 +30,62 @@ import shutil
 import subprocess
 import numpy as np
 from PIL import Image
-from scipy import ndimage
 
-MASK_DIR = "vids/moving_objects/ants/filter"     # supplies the band's top edge
 SRC_CLIP = "vids/moving_objects/ants/0001-0123.mp4"   # unmasked original
 OUT = "renders/ants_smooth"
 TMP = "/tmp/_ants_src"
 
-EDGE_SMOOTH = 241   # px window for smoothing the top edge along x — bigger = rounder
-FEATHER = 8         # px of vertical fade across the edge — just enough to
-                    # antialias the curve; wider reads as a dark haze on the ground
-DARK = 10           # luma at or below this counts as masked-out black
+# The renderer draws this texture shifted down by ANT_SHIFT_Y, so texture y and
+# screen y differ by this much. Kept here only so the numbers printed below are
+# in the terms you actually see. Must match main.cpp.
+SHIFT_Y = 345
 
-# Push the horizon up off the ants. The mask is a motion-isolation pass, so its
-# top edge lands exactly where ant motion stops being detected — which is to say
-# it runs through the topmost ants and cuts them in half. Measured: the trail's
-# per-column top is y 279 at the 5th percentile, while the raw curve reaches
-# y 478 at its lowest. Lifting by that difference clears the whole trail and
-# still leaves the ground below the title text, which ends around y 390 on
-# screen (the renderer draws this texture shifted down 345 px).
-EDGE_LIFT = 200
+# The horizon: a plain arc, peaking at PEAK_Y in the middle and falling DOME px
+# to either edge. PEAK_Y is bounded above by the title text, which ends near
+# screen y 390 — allow FEATHER/2 on top of PEAK_Y before comparing.
+PEAK_Y = 146        # texture y at the top of the arc (screen 491)
+DOME = 300          # px the arc falls from centre to either edge
+
+FEATHER = 80        # px of vertical fade across the horizon. Wide enough to read
+                    # as the ground dissolving into the dark rather than a cut.
+                    # It is centred on the curve, reaching FEATHER/2 either side.
 
 
-def extract_source(n_frames):
+def extract_source():
     if os.path.isdir(TMP):
         shutil.rmtree(TMP)
     os.makedirs(TMP)
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", SRC_CLIP,
-         "-frames:v", str(n_frames), f"{TMP}/%04d.png"],
-        check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-i", SRC_CLIP, f"{TMP}/%04d.png"],
+                   check=True)
     return sorted(f for f in os.listdir(TMP) if f.endswith(".png"))
 
 
-def raw_edge(mask):
-    """First masked row per column; NaN where the column is empty top to
-    bottom, so those columns abstain from the median instead of voting 0."""
-    idx = np.argmax(mask, axis=0).astype(np.float64)
-    idx[~mask.any(axis=0)] = np.nan
-    return idx
-
-
-def stable_edge(masks):
-    """One horizon for the whole sequence: the per-column median of the raw
-    edges, hole-filled, then smoothed hard along x."""
-    raw = np.array([raw_edge(m) for m in masks])       # frames x width
-    with np.errstate(invalid="ignore"):
-        idx = np.nanmedian(raw, axis=0)
-    h, w = masks[0].shape
-    has = ~np.isnan(idx)
-    if not has.any():
-        return np.full(w, h / 2.0)
-    xs = np.arange(w)
-    idx = np.interp(xs, xs[has], idx[has])             # nearest-fill the holes
-    idx = ndimage.uniform_filter1d(idx, size=EDGE_SMOOTH, mode="nearest")
-    idx = ndimage.gaussian_filter1d(idx, sigma=EDGE_SMOOTH / 6.0, mode="nearest")
-    return np.maximum(idx - EDGE_LIFT, 0.0)
+def horizon(w):
+    """Symmetric arc across the frame, in texture rows."""
+    x = np.linspace(0.0, 1.0, w)
+    return PEAK_Y + DOME * (1.0 - np.sin(np.pi * x))
 
 
 def main():
-    names = sorted(f for f in os.listdir(MASK_DIR)
-                   if f.endswith(".png") and not f.startswith("._"))
+    names = extract_source()
     if not names:
-        raise SystemExit(f"no frames in {MASK_DIR}")
-    src_names = extract_source(len(names))
-    if len(src_names) < len(names):
-        raise SystemExit(f"{SRC_CLIP} gave {len(src_names)} frames, need {len(names)}")
-
-    masks = [np.array(Image.open(os.path.join(MASK_DIR, n)).convert("L")) > DARK
-             for n in names]
-    edge = stable_edge(masks)
-    mh, mw = masks[0].shape
-    del masks
+        raise SystemExit(f"{SRC_CLIP} gave no frames")
 
     os.makedirs(OUT, exist_ok=True)
-    scaled = None
+    alpha = None
     for i, name in enumerate(names):
-        src = np.array(Image.open(os.path.join(TMP, src_names[i])).convert("RGB"))
+        src = np.array(Image.open(os.path.join(TMP, name)).convert("RGB"))
         h, w = src.shape[:2]
-        if scaled is None:                         # keep the edge in source pixels
-            scaled = edge * (h / mh) if (mh, mw) != (h, w) else edge
-            if (mh, mw) != (h, w):
-                scaled = np.interp(np.linspace(0, mw - 1, w), np.arange(mw), scaled)
-            # 0 above the edge, 1 below, smoothstepped across FEATHER px. The
-            # edge never moves, so this ramp is built once and reused.
+        if alpha is None:
+            e = horizon(w)
+            # 0 above the curve, 1 below, smoothstepped across FEATHER px. The
+            # horizon never moves, so this ramp is built once and reused.
             ys = np.arange(h)[:, None]
-            t = np.clip((ys - (scaled[None, :] - FEATHER / 2.0)) / FEATHER, 0.0, 1.0)
+            t = np.clip((ys - (e[None, :] - FEATHER / 2.0)) / FEATHER, 0.0, 1.0)
             alpha = (t * t * (3.0 - 2.0 * t))[:, :, None]
-            print(f"edge y {scaled.min():.0f}-{scaled.max():.0f} "
-                  f"(on screen {scaled.min()+345:.0f}-{scaled.max()+345:.0f}), "
-                  f"lift {EDGE_LIFT} px, feather {FEATHER} px")
+            print(f"horizon: peak screen y {e.min()+SHIFT_Y:.0f} "
+                  f"(fading from {e.min()+SHIFT_Y-FEATHER/2:.0f}), "
+                  f"edges {e.max()+SHIFT_Y:.0f}, dome {DOME} px, feather {FEATHER} px")
 
         out = (src.astype(np.float32) * alpha).astype(np.uint8)
         Image.fromarray(out).save(os.path.join(OUT, name))

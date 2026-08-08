@@ -312,13 +312,16 @@ static glm::mat4 rectMatrix(float x, float y, float w, float h) {
 // ============================================================================
 // APP STATE
 // ============================================================================
-// After CENTER_HOLD the piece keeps pulling back: the digital sprite is swapped
-// for a hand-drawn one (HAND_DRAWN), then three camera zoom-outs reveal a
-// hand-drawn audience one nested level at a time (AUDIENCE_1..3). DOWN advances.
+// DOWN out of the walk begins CENTERING: the man (turning right first if he was
+// facing left) slides + scales to screen-centre while the background darkens
+// smoothly, settling on AUDIENCE_0 — the centred man over a darkened waves
+// backdrop with NO crowd yet. Each further DOWN is a "step back" (AUDIENCE_1..3):
+// the crowd is progressively revealed (skew + translate + fade), the man drifts
+// left and shrinks, and the left darkens. A DOWN at AUDIENCE_3 heads for the exit.
 enum class AppState { TITLE, INTRO, BACK_POSE, ENTERING_RIGHT,
                       WALKING_RIGHT, WALKING_LEFT,
-                      CENTER_SLIDE, CENTER_HOLD,
-                      HAND_DRAWN, AUDIENCE_1, AUDIENCE_2, AUDIENCE_3,
+                      CENTERING,
+                      AUDIENCE_0, AUDIENCE_1, AUDIENCE_2, AUDIENCE_3,
                       OUTRO };
 enum class WalkSub  { IDLE, LEFT_FOOT, RIGHT_FOOT, SHAKE_HEAD, TURN};
 
@@ -560,13 +563,7 @@ struct TitleScreen {
 
     bool load(GLuint prog) {
         static const char* const kCandidates[] = {
-            R"(when i was little, i would have these dreams about my family selling drugs. we lived in a
-            little room. there was a bathtub in the corner, and it was always filled with needles. one night, 
-            i dreamt that i came home to that shack, and my family was inside, dead. 
-            i walked out, barefoot and dirty, stepping down the sidewalk.
-            i had woken up with a popping wetness in my hands. 
-            in the dream, i had stepped on a needle and died.)",
-             "..."
+            "I exist in constant oscillation, disturbed by external forces and pulled towards my unchanging true self...",
         };
         constexpr int kCandidateCount = (int)(sizeof(kCandidates)/sizeof(kCandidates[0]));
         std::mt19937 rng{ std::random_device{}() };
@@ -1288,28 +1285,17 @@ struct App {
     bool leftKeyPressed  = false;
     bool downKeyPressed  = false;
 
-    // CENTER_SLIDE / CENTER_HOLD / OUTRO state
+    // Audience / OUTRO state
     SpriteSeq seqSmoothBug;       // 301 RGBA frames — bug clip, played once in OUTRO
     SpriteSeq seqExit;            // exit/ frame sequence — final exit animation
     bool      pendingCenter = false;   // set when DOWN pressed during a walk
     // The centered man is one digital sprite (enter_right/0089) that replaces
-    // the old hand-drawn "standing man" from CENTER_HOLD all the way through the
-    // audience pull-back. manCentroidX/manBottomY are measured off it at load.
+    // the old hand-drawn "standing man" — the whole audience section is drawn
+    // with it. manCentroidX/manBottomY are measured off it at load.
     BoilStill manSprite;
-    // CENTER_SLIDE: a pure screen-space translate of manSprite from where the
-    // walk left him to screen-centre / feet-on-bottom. No scale, no fade.
-    double    slideStartTime = 0.0;
-    float     slideStartTx = 0.f, slideStartTy = 0.f;
-    float     slideEndTx   = 0.f, slideEndTy   = 0.f;
-    static constexpr double CENTER_SLIDE_SEC = 0.5;
-    float     wavesAlpha = 0.5f;       // 0.5 while walking; 2.0 as audience backdrop
-    // The waves are treated as a backdrop that shares the camera move: they
-    // push in at the hand-drawn cut, then pull back in proportion with every
-    // zoom-out phase. WAVES_CENTER_ZOOM is chosen so that even at the widest
-    // shot the scaled texture still covers the frame (1.5 × Z_D/Z_A ≈ 1.04),
-    // which is what stops black edges creeping in at the borders.
-    float     wavesScale = 1.f;
-    static constexpr float WAVES_CENTER_ZOOM = 1.5f;
+    // Waves overlay strength: 0.5 while walking, 2.0 as the audience backdrop.
+    // It always draws full-frame now (no camera scale), so no scale member.
+    float     wavesAlpha = 0.5f;
 
     // OUTRO: begins on a key press from AUDIENCE_3 (waves gone). The hand-drawn
     // exit/ animation plays alone, centred on black, with the (quieter) exit
@@ -1322,64 +1308,80 @@ struct App {
     static constexpr double OUTRO_FRAME_SEC   = 1.0/24.0;  // bug clip ~24 fps
     static constexpr float  EXIT_AUDIO_GAIN   = 0.5f;      // exit recording volume
 
-    // ── Hand-drawn pull-back (HAND_DRAWN → AUDIENCE_1/2/3) ───────────────────
-    // Hand-drawn line art on transparent backgrounds. The audience levels are
-    // nested bottom-left-aligned crops of one master drawing (l1 sits in l2 at
-    // (0,244), l2 sits in l3 at (0,158)), so a single world origin places every
-    // one of them. l3 is pre-split by boil_stills.py into the near figures
-    // (l3_back) and the receding rows (l3_front) so the bug clip can be drawn
-    // between them.
-    //
-    // These were 100-frame loops until the frames were measured against each
-    // other: ink sat a median of 0 px and a p90 of 1 px from frame 0, i.e. one
-    // drawing being redrawn rather than anything animating. They are single
-    // stills now, boiled by FS_BOIL_TINT at the same 20 fps the loops ran at.
-    // Splitting l3 once rather than per frame also stopped ink popping between
-    // the two layers, which the per-frame blob labelling used to cause.
-    BoilStill stillAudL1, stillAudL2, stillAudL3Back, stillAudL3Front;
+    // ── Hand-drawn pull-back (AUDIENCE_0 → AUDIENCE_1/2/3) ───────────────────
+    // The audience crowd is one hand-drawn still, pre-split by boil_stills.py
+    // into the near figures (l3_back) and the receding rows (l3_front) so the
+    // bug clip can be drawn between them. Boiled by FS_BOIL_TINT at 20 fps (they
+    // were 100-frame loops that measured as one drawing being redrawn — p90 1 px).
+    BoilStill stillAudL3Back, stillAudL3Front;
     static constexpr double HAND_BOIL_HZ = 20.0;   // re-settle rate, was the loop cadence
     static constexpr float  HAND_BOIL_PX = 1.0f;   // p90 line displacement, measured
 
-    // Everything in these phases is placed by one virtual camera that zooms
-    // about a focal point on the screen's bottom edge, so the man's feet and
-    // the audience's bottom row stay pinned to y = WIN_H for free:
-    //     screenX = CAM_FOCAL_X + Z * (worldX - CAM_FOCAL_X)
-    //     screenScale = Z * worldScale
-    // CAM_FOCAL_X and CAM_ZOOM_STEP are the exact solution to sending the man's
-    // centroid 960 → 720 → … → 320 over three equal zoom steps: with
-    // a = 960 - F, (720-F) = k(960-F) and (320-F) = k³(960-F) reduce to
-    // a² - 2160a + 172800 = 0, giving a = 1080 + sqrt(993600).
-    static constexpr float CAM_FOCAL_X    = -1116.796f;
-    static constexpr float CAM_ZOOM_STEP  = 0.884434f;
-    // Man centroid X 320 at Z=1 (widest) → 960 at the tightest shot Z=stageZoom(0).
-    // MAN_WORLD_SCALE is 1/stageZoom(0), so at the tightest shot ms = Z*scale = 1:
-    // manSprite (a full 1920×1080 frame) then draws at native size, exactly
-    // matching the CENTER_SLIDE end pose, and shrinks from there as the crowd is
-    // revealed. stageZoom(0) = (1/CAM_ZOOM_STEP)^3 ≈ 1.44561.
-    static constexpr float MAN_WORLD_X     = 320.0f;
-    static constexpr float MAN_WORLD_SCALE = 0.691748f;
-    // Audience at Z=1: drawing's bottom-left corner at x=480, scaled so the
-    // full level-3 crop spans 480 → 1920 (1440/1394).
+    // The audience section is a fixed-size framing (no camera zoom): the crowd
+    // fills a rect on the right, the man stands on the left. The sense of
+    // "stepping back" comes not from scaling the world but, one step per DOWN
+    // (indexed by `stage`, eased by stageT), from revealing more of the crowd
+    // (fade + recede + deepening skew), drifting the man left and shrinking him,
+    // and darkening the left. AUD_WORLD_* place the crowd via drawAudience at the
+    // level-3 framing: the bottom-left corner at x=480, the crop spanning 480 →
+    // 1920. Earlier levels shrink + offset it off that anchor (AUD_CROWD_*).
     static constexpr float AUD_WORLD_X     = 480.0f;
     static constexpr float AUD_WORLD_SCALE = 1.033000f;
+    // The man: a static digital sprite, centroid at MAN_AUD_X[stage], feet on the
+    // screen bottom. He lands slightly left of centre (level 0, even before any
+    // crowd), then drifts gently further left and shrinks a touch as the crowd is
+    // revealed — small, even steps so the moves between levels stay subtle and he
+    // ends up fairly large and close to the audience rather than tiny and far off.
+    static constexpr float MAN_AUD_X[4]     = { 820.0f, 720.0f, 640.0f, 580.0f };
+    static constexpr float MAN_AUD_SCALE[4] = { 0.92f, 0.88f, 0.85f, 0.82f };
+    // Per-level scene effects, eased between levels by stageT (see audLerp):
+    static constexpr float AUD_SKEW[4]      = { 0.00f, 0.14f, 0.26f, 0.38f }; // left-recede
+    static constexpr float AUD_LEFT_DARK[4] = { 0.10f, 0.25f, 0.40f, 0.55f }; // left gradient
+    static constexpr float AUD_DARK_BG      = 0.35f;   // flat darken over the video
+    // Crowd reveal, per level: hidden at level 0, then faded up while it recedes
+    // (scales down) and slides up-and-in from the lower-right, so each step back
+    // shows more of the audience. Eased by audLerp like everything else.
+    static constexpr float AUD_CROWD_ALPHA[4] = { 0.00f, 0.60f, 0.85f, 1.00f };
+    static constexpr float AUD_CROWD_SCALE[4] = { 1.35f, 1.20f, 1.08f, 1.00f };
+    static constexpr float AUD_CROWD_DX[4]    = { 260.0f, 150.0f,  60.0f, 0.0f };
+    static constexpr float AUD_CROWD_DY[4]    = { 220.0f, 120.0f,  45.0f, 0.0f };
+    // Background video zoom, per level: the centering slide pushes the camera IN
+    // (bg magnifies to BG_ZOOM[0]); each step back pulls it OUT with the man and
+    // crowd, settling at 1.0 (full frame) by the widest level. Scaled about the
+    // screen centre in NDC. See bgZoomNow().
+    static constexpr float BG_ZOOM[4]         = { 1.50f, 1.32f, 1.16f, 1.00f };
+    glm::mat4 audSkew{1.f};   // current left-receding perspective, rebuilt each frame
 
-    // Once the hand-drawn phase starts, the scene video comes back instead of
-    // black and a low-opacity dark green wash goes over everything — video,
-    // crowd and man alike. It switches on hard at that boundary rather than
-    // fading, so the swap to the hand-drawn sprite reads as a cut.
+    // ── Centering transition (walk → AUDIENCE_0) ─────────────────────────────
+    // A smooth move into the centred pose: manSprite translates + scales from
+    // where the walk left the character to screen-centre (feet on the bottom),
+    // while the audience darkening fades in. Settles on AUDIENCE_0 (no crowd
+    // yet). The start pose is snapshotted in beginCentering; the end pose is the
+    // level-0 man (MAN_AUD_SCALE[0] at MAN_AUD_X[0]) so the handoff is seamless.
+    double centerStartTime  = 0.0;
+    float  centerStartScale = 1.0f;   // walk sprite draws at native (scale 1)
+    float  centerStartCX    = 0.0f;   // where the walk left his centroid X …
+    float  centerStartBY    = 0.0f;   // … and his feet (bbox-bottom) Y, on screen
+    static constexpr double CENTER_SLIDE_SEC = 1.4;   // slow, deliberate move to centre
+    // 0→1 audience-darkening ramp: driven up during CENTERING, held at 1 through
+    // the audience so greenAlpha / flat dark / waves come in smoothly, not as a cut.
+    float  darkT = 0.f;
+
+    // Once the audience starts, a low-opacity dark green wash goes over
+    // everything — video, crowd and man alike — switched on hard as a cut.
     float  greenAlpha = 0.f;
     static constexpr float GREEN_R = 0.05f, GREEN_G = 0.16f, GREEN_B = 0.09f;
     static constexpr float GREEN_MAX = 0.38f;
 
-    int    stage  = 0;      // 0 = HAND_DRAWN … 3 = AUDIENCE_3
+    int    stage  = 0;      // 0 = AUDIENCE_0 … 3 = AUDIENCE_3
     float  stageT = 1.f;    // 0→1 progress of the move into `stage`
     double stageStartTime = 0.0;
-    static constexpr double STAGE_XFADE_SEC = 1.2;   // zoom + cross-fade length
+    static constexpr double STAGE_XFADE_SEC = 2.4;   // zoom + cross-fade length (slow step-back)
     float  manCentroidX = 0.f, manBottomY = 0.f;     // manSprite feet anchor
 
-    // The hand-drawn ink is black, which is invisible against the black these
-    // phases run on — the audience is recoloured to a white outline at draw
-    // time. The man stays black, as he already does at CENTER_HOLD.
+    // The crowd's hand-drawn ink is recoloured to a white outline at draw time
+    // so it reads against the darkened backdrop. The man is the digital sprite,
+    // drawn as-is.
     glm::vec3 audTint{1.f, 1.f, 1.f};
 
     // ── Exit screen ──────────────────────────────────────────────────────────
@@ -1408,21 +1410,71 @@ struct App {
     static constexpr float  BUG_CONTENT_HX = 189.f, BUG_CONTENT_HY = 164.f;
     std::mt19937 bugRng{ std::random_device{}() };
     std::uniform_real_distribution<float> bugRoll{0.f, 1.f};
-    // AUDIENCE_3 falls through to the exit on its own if left alone.
-    double audience3EndTime = 0.0;
-    static constexpr double AUDIENCE_3_HOLD_SEC = 15.0;
 
-    // Zoom for stage n, counting down from the tightest shot: Z = k^(3-n).
-    static float stageZoom(int n) {
-        float z = 1.f;
-        for (int i = n; i < 3; ++i) z /= CAM_ZOOM_STEP;
-        return z;
+    // Eased per-level value: interpolate arr[stage-1]→arr[stage] by the
+    // smoothstepped move progress. At AUDIENCE_0 (stageT=1) it reads arr[0].
+    float audLerp(const float arr[4]) const {
+        const int   s0 = stage > 0 ? stage - 1 : 0;
+        const float t  = stageT * stageT * (3.f - 2.f * stageT);
+        return arr[s0] + (arr[stage] - arr[s0]) * t;
     }
-    // Live zoom, easing from the previous stage into the current one.
-    float currentZoom() const {
-        const float t  = stageT * stageT * (3.f - 2.f * stageT);   // smoothstep
-        const float z0 = stageZoom(stage > 0 ? stage - 1 : 0);
-        return z0 + (stageZoom(stage) - z0) * t;
+
+    // Current background-video zoom: 1.0 while walking, ramping to BG_ZOOM[0]
+    // across the centering slide (eased by darkT), then eased down through the
+    // audience levels (BG_ZOOM[stage]) so the camera pulls back with the man and
+    // crowd. 1.0 everywhere else.
+    float bgZoomNow() const {
+        switch (appState) {
+            case AppState::CENTERING:
+                return 1.0f + (BG_ZOOM[0] - 1.0f) * darkT;
+            case AppState::AUDIENCE_0:
+            case AppState::AUDIENCE_1:
+            case AppState::AUDIENCE_2:
+            case AppState::AUDIENCE_3:
+                return audLerp(BG_ZOOM);
+            default:
+                return 1.0f;
+        }
+    }
+
+    // Background-wave playback speed, tied to the zoom: normal (1.0) while
+    // walking and through the centering push-in, then slowing as the camera pulls
+    // back across the audience levels (fast/current when zoomed in, slow when
+    // zoomed out). Never zero, so it is safe to divide the frame interval by it.
+    static constexpr float WAVES_SLOW = 0.40f;   // speed at the fully zoomed-out level
+    float wavesSpeedFactor() const {
+        switch (appState) {
+            case AppState::AUDIENCE_0:
+            case AppState::AUDIENCE_1:
+            case AppState::AUDIENCE_2:
+            case AppState::AUDIENCE_3: {
+                // 0 at the widest (zoomed-out) level → 1 at the tightest (in).
+                const float f = (bgZoomNow() - 1.0f) / (BG_ZOOM[0] - 1.0f);
+                return WAVES_SLOW + (1.0f - WAVES_SLOW) * f;
+            }
+            default:
+                return 1.0f;
+        }
+    }
+
+    // Left-receding perspective for the audience "zoom out": the bottom-right
+    // corner stays fixed (the ground line) while the left edge is pushed inward
+    // and foreshortened toward the bottom, so the left reads as farther away.
+    // `amt` is the extra projective weight at the far-left edge (0 = flat).
+    glm::mat4 sceneSkew(float amt) const {
+        if (amt <= 0.f) return glm::mat4(1.f);
+        const float W = (float)cfg::WIN_W;
+        const float H = (float)cfg::WIN_H;
+        // Flip to a right/bottom origin so the weight grows leftward and the
+        // bottom edge is the fixed ground line, apply a horizontal perspective,
+        // flip back: Hp = T · Hs · T (T is its own inverse).
+        float T[3][3]  = {{-1.f,0.f,W},{0.f,-1.f,H},{0.f,0.f,1.f}};
+        float Hs[3][3] = {{1.f,0.f,0.f},{0.f,1.f,0.f},{amt/W,0.f,1.f}};
+        float tmp[3][3], Hp[3][3];
+        mat3Mul(T, Hs, tmp);
+        mat3Mul(tmp, T, Hp);
+        float Hn[3][3]; homPixToNDC(Hp, Hn);
+        return embedHom(Hn);
     }
 
     static void mat3SetIdentity(float M[3][3]) {
@@ -1536,9 +1588,8 @@ struct App {
         } else {
             memcpy(Hp, Hg_pixel, sizeof(Hp));
         }
-        // Walk_left frames are warped into walk_right space. CENTER_SLIDE runs
-        // in walk_right space too (the man has already turned right), so it needs
-        // no warp — just the translation-only Hg_pixel built for the slide.
+        // Walk_left frames are warped into walk_right space. (The audience man is
+        // drawn separately, not through this matrix.)
         if (appState == AppState::WALKING_LEFT) {
             float Hp2[3][3];
             mat3Mul(Hp, hom::H_left_px_to_right, Hp2);
@@ -1599,25 +1650,26 @@ struct App {
         mixer.vidSrc = prev;
     }
 
-    // Screen rect for the centred man at camera zoom Z. At the tightest shot
-    // (Z = stageZoom(0)) ms = 1, so manSprite draws at native full-frame size
-    // with his centroid at screen-centre X and his feet on the bottom — the same
-    // pose CENTER_SLIDE ends on. Wider shots shrink and drift him left with the
-    // rest of the world. Used for CENTER_HOLD and every audience level.
-    glm::mat4 manRectMatrix(float Z) const {
-        const float ms = Z * MAN_WORLD_SCALE;
-        const float mx = CAM_FOCAL_X + Z * (MAN_WORLD_X - CAM_FOCAL_X);
-        return rectMatrix(mx - ms*manCentroidX,
-                          (float)cfg::WIN_H - ms*manBottomY,
-                          ms*(float)manSprite.w, ms*(float)manSprite.h);
+    // Screen rect for manSprite at a given scale, placing his centroid at
+    // (centroidX) and his feet (bbox-bottom) at (bottomY). The audience/centering
+    // both anchor him this way, so the CENTERING → AUDIENCE_0 handoff is exact.
+    glm::mat4 manRectAt(float scale, float centroidX, float bottomY) const {
+        return rectMatrix(centroidX - scale*manCentroidX,
+                          bottomY   - scale*manBottomY,
+                          scale*(float)manSprite.w, scale*(float)manSprite.h);
     }
 
-    // DOWN → centre, from any pose. Facing right slides straight in; facing left
-    // first turns to the right (reusing the walk-turn machinery), and the slide
-    // fires when that turn lands back at IDLE. Returns true if it consumed the
-    // frame so the caller breaks out of the walk case.
+    // Audience placement: centroid at the given X, feet on the screen bottom.
+    glm::mat4 manAudRect(float scale, float centroidX) const {
+        return manRectAt(scale, centroidX, (float)cfg::WIN_H);
+    }
+
+    // DOWN out of the walk → begin the centering transition. Facing right slides
+    // straight in; facing left first turns to the right (reusing the walk-turn
+    // machinery), and the slide fires when that turn lands back at IDLE. Returns
+    // true if it consumed the frame so the caller breaks out of the walk case.
     bool startCentering(double now) {
-        if (appState == AppState::WALKING_RIGHT) { beginCenterSlide(now); return true; }
+        if (appState == AppState::WALKING_RIGHT) { beginCentering(now); return true; }
         // Facing left: kick off a turn to the right, exactly like an opposite-key
         // press, but leave pendingCenter set so the slide fires after the turn.
         if (stepsInCycle == 1) memcpy(Hg_turn, hom::H_left_step_half, sizeof(Hg_turn));
@@ -1630,35 +1682,32 @@ struct App {
         return true;
     }
 
-    // Begin the pure translate to centre from WALKING_RIGHT IDLE. Snapshots where
-    // manSprite's centroid currently lands, then interpolates a translation-only
-    // sprite matrix to (screen-centre X, feet on bottom) over CENTER_SLIDE_SEC.
-    // No scale change, no fade — the live scene video stays under the waves.
-    void beginCenterSlide(double now) {
-        // Snapshot where the walk actually left the character — its idle centroid
-        // X and feet (bbox-bottom) Y — under the live transform (WALKING_RIGHT
-        // space here, no left warp). Anchoring the slide on THIS, not manSprite's
-        // own centroid, makes the frame swap to manSprite land his feet exactly
-        // where the walk pose stood, with no sideways jump.
+    // Begin the translate + scale to centre from WALKING_RIGHT IDLE. Snapshots
+    // where the walk actually left the character (its idle centroid X and feet Y,
+    // on screen), then CENTERING interpolates manSprite from that pose to the
+    // level-0 audience pose (screen-centre, feet on the bottom, MAN_AUD_SCALE[0])
+    // while the darkening (darkT) fades in.
+    void beginCentering(double now) {
+        // Snapshot the walk's idle centroid/feet under the live transform
+        // (WALKING_RIGHT space here, no left warp). Anchoring the swap to this,
+        // not manSprite's own centroid, lands his feet where the walk pose stood.
         float wx, wy;
         idleFrameTexel(/*isLeft=*/false, wx, wy);
         const float pw = Hg_pixel[2][0]*wx + Hg_pixel[2][1]*wy + Hg_pixel[2][2];
         const float px = (Hg_pixel[0][0]*wx + Hg_pixel[0][1]*wy + Hg_pixel[0][2]) / pw;
         const float py = (Hg_pixel[1][0]*wx + Hg_pixel[1][1]*wy + Hg_pixel[1][2]) / pw;
-        const float sx = Hg_lift[0][0]*px + Hg_lift[0][1]*py + Hg_lift[0][2];
-        const float sy = Hg_lift[1][0]*px + Hg_lift[1][1]*py + Hg_lift[1][2];
-        mat3SetIdentity(Hg_pixel);
-        mat3SetIdentity(Hg_lift);
-        mat3SetIdentity(Hg_turn);
-        slideStartTx = sx - manCentroidX;
-        slideStartTy = sy - manBottomY;
-        slideEndTx   = (float)cfg::WIN_W * 0.5f - manCentroidX;   // centroid → screen centre
-        slideEndTy   = (float)cfg::WIN_H        - manBottomY;     // feet → screen bottom
-        Hg_pixel[0][2] = slideStartTx;
-        Hg_pixel[1][2] = slideStartTy;
-        slideStartTime = now;
+        centerStartCX    = Hg_lift[0][0]*px + Hg_lift[0][1]*py + Hg_lift[0][2];
+        centerStartBY    = Hg_lift[1][0]*px + Hg_lift[1][1]*py + Hg_lift[1][2];
+        centerStartScale = 1.0f;    // walk frames draw at native full-frame size
+        centerStartTime  = now;
+
+        releaseWalkSequences();     // the walk sprites are behind us for good
         walkSub  = WalkSub::IDLE;
-        appState = AppState::CENTER_SLIDE;
+        stage = 0;
+        stageT = 1.f;
+        stageStartTime = now;
+        darkT = 0.f;                // ramps up over the slide (no hard cut)
+        appState = AppState::CENTERING;
         pendingCenter = false;
         anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
         walkClip.stop();
@@ -1667,16 +1716,6 @@ struct App {
         mixer.vidSrc  = &titleAudio;
         mixer.vidSrc2 = nullptr;
         mixer.bgGain.store(1.0f);
-    }
-
-    // Right-edge alpha of the audience darkness gradient at the current depth:
-    // it deepens each level (0 while the man is close, strongest at the widest
-    // crowd shot), eased across the zoom between levels.
-    float gradRightAlpha() const {
-        static const float GA[4] = { 0.f, 0.18f, 0.34f, 0.50f };  // per stage
-        const int   s0 = stage > 0 ? stage - 1 : 0;
-        const float tt = stageT * stageT * (3.f - 2.f * stageT);
-        return GA[s0] + (GA[stage] - GA[s0]) * tt;
     }
 
     // Drop every walk-cycle sprite sequence. Once the character has centred he
@@ -1690,33 +1729,40 @@ struct App {
         // returns 0 and drawTex early-outs, which is safer than nulling them.
     }
 
-    // Place an audience layer by the drawing's shared bottom-left corner, with
-    // its bottom row on the screen bottom. All three levels are nested crops of
-    // one drawing anchored at that corner — including the pre-split level-3
-    // back layer, which is cropped to the level-2 rect and so shares it too —
-    // which is why one expression positions every layer at any zoom.
-    void drawAudience(BoilStill& still, float Z, float alpha, double now) {
+    // Un-skewed screen rect the crowd fills at the current (eased) reveal level:
+    // the level-3 anchor is bottom-left at AUD_WORLD_X, bottom row on the screen
+    // bottom, crop spanning 480 → 1920. Earlier levels are larger (closer) and
+    // offset down/right (AUD_CROWD_SCALE/DX/DY), so stepping back recedes the
+    // crowd into full view. Shared by drawAudience and the bug-bounds helper.
+    void crowdRect(float w0, float h0, float& x0, float& y0, float& w, float& h) const {
+        const float cScale = AUD_WORLD_SCALE * audLerp(AUD_CROWD_SCALE);
+        w = cScale * w0;
+        h = cScale * h0;
+        x0 = AUD_WORLD_X          + audLerp(AUD_CROWD_DX);
+        y0 = (float)cfg::WIN_H - h + audLerp(AUD_CROWD_DY);
+    }
+
+    // Draw a crowd layer at the current reveal framing, folding in the current
+    // left-receding skew. alpha is the eased per-level crowd opacity.
+    void drawAudience(BoilStill& still, float alpha, double now) {
         if (!still.loaded || alpha <= 0.f) return;
-        const float as = Z * AUD_WORLD_SCALE;
-        const float ax = CAM_FOCAL_X + Z * (AUD_WORLD_X - CAM_FOCAL_X);
-        const float w  = as * still.w;
-        const float h  = as * still.h;
+        float x0, y0, w, h;
+        crowdRect(still.w, still.h, x0, y0, w, h);
         drawBoiledTinted(progBoilTint, quad, still.current(),
-                         rectMatrix(ax, (float)cfg::WIN_H - h, w, h),
+                         audSkew * rectMatrix(x0, y0, w, h),
                          w, h, HAND_BOIL_PX,
                          (float)std::floor(now*HAND_BOIL_HZ), audTint, alpha);
     }
 
-    // Screen rect the crowd fills at zoom Z, measured from the widest (level-3)
-    // crop so it covers every level. Used to keep the bug inside the audience.
-    void audienceRect(float Z, float& x0, float& y0, float& x1, float& y1) const {
-        const float as = Z * AUD_WORLD_SCALE;
-        const float w  = as * (stillAudL3Front.w ? stillAudL3Front.w : 1394);
-        const float h  = as * (stillAudL3Front.h ? stillAudL3Front.h : 748);
-        x0 = CAM_FOCAL_X + Z * (AUD_WORLD_X - CAM_FOCAL_X);
+    // Fixed (un-skewed) screen rect the crowd fills; used to keep the bug inside.
+    // Tracks the same eased reveal framing as drawAudience.
+    void audienceRect(float& x0, float& y0, float& x1, float& y1) const {
+        const float w0 = stillAudL3Front.w ? stillAudL3Front.w : 1394;
+        const float h0 = stillAudL3Front.h ? stillAudL3Front.h : 748;
+        float w, h;
+        crowdRect(w0, h0, x0, y0, w, h);
         x1 = x0 + w;
-        y1 = (float)cfg::WIN_H;
-        y0 = y1 - h;
+        y1 = y0 + h;
     }
 
     // Hand off to the exit screen: the hand-drawn Exit over black, paced to
@@ -1726,7 +1772,6 @@ struct App {
         // Nothing but the exit drawing is on screen from here, so the crowd,
         // the bug and the man all go.
         manSprite.unload();
-        stillAudL1.unload(); stillAudL2.unload();
         stillAudL3Back.unload(); stillAudL3Front.unload();
         seqSmoothBug.unload();
         seqBg.unload();          // waves overlay is deliberately absent here
@@ -1984,12 +2029,10 @@ struct App {
         dirRight = { &seqLeftFoot,   &seqRightFoot,   &seqShakeHead,   &seqWLTurnRight, +1 };
         dirLeft  = { &seqWLLeftFoot, &seqWLRightFoot, &seqWLShakeHead, &seqTurnLeft,    -1 };
 
-        // The centred man is a single digital sprite — the last frame of the
-        // enter-right walk-on, a canonical right-facing standing pose (its anchor
-        // matches R_IDLE_FIRST, so swapping to it from a walk idle is seamless).
-        // It replaces the old hand-drawn man from CENTER_HOLD through the whole
-        // audience pull-back, so it is loaded once and kept. Its anchor (alpha
-        // centroid X + bbox-bottom Y) plants it by the feet at any zoom.
+        // The audience man is a single digital sprite — the last frame of the
+        // enter-right walk-on, a canonical right-facing standing pose. It is the
+        // man for the whole audience section, loaded once and kept. Its anchor
+        // (alpha centroid X + bbox-bottom Y) plants it by the feet at any scale.
         static const char* kManSprite = "renders/enter_right/0089.png";
         if (!manSprite.load(kManSprite))
             std::cerr<<"[man] No "<<kManSprite<<"\n";
@@ -1998,10 +2041,6 @@ struct App {
             manCentroidX = manSprite.w * 0.5f;
             manBottomY   = (float)manSprite.h;
         }
-        if (!stillAudL1.load("renders/stills/aud_l1.png"))
-            std::cerr<<"[aud] No renders/stills/aud_l1.png (run boil_stills.py)\n";
-        if (!stillAudL2.load("renders/stills/aud_l2.png"))
-            std::cerr<<"[aud] No renders/stills/aud_l2.png (run boil_stills.py)\n";
         if (!stillAudL3Back.load("renders/stills/aud_l3_back.png"))
             std::cerr<<"[aud] No renders/stills/aud_l3_back.png (run boil_stills.py)\n";
         if (!stillAudL3Front.load("renders/stills/aud_l3_front.png"))
@@ -2066,7 +2105,7 @@ struct App {
 
             double now  = glfwGetTime();
             bool advI   = (now-lastIntroTime)  >= introFrameTime;
-            bool advBg  = (now-lastBgTime)     >= bgFrameTime;
+            bool advBg  = (now-lastBgTime)     >= bgFrameTime / wavesSpeedFactor();
             bool advAnt = (now-lastAntTime)    >= antFrameTime;
             bool advBgV = (now-lastBgVidTime)  >= bgVidFrameTime;
             bool advS   = (now-lastSpriteTime) >= spriteFrameTime;
@@ -2148,8 +2187,7 @@ struct App {
             case AppState::WALKING_LEFT: {
                 const bool isRight     = (appState==AppState::WALKING_RIGHT);
                 // DOWN ("back") from either direction → defer to the next clean
-                // IDLE, then centre (startCentering: slide if facing right, turn
-                // to the right first if facing left).
+                // IDLE, then begin the centering transition (startCentering).
                 if (downKeyPressed) {
                     pendingCenter = true;
                     downKeyPressed = false;
@@ -2218,78 +2256,49 @@ struct App {
                 break;
             }
 
-            case AppState::CENTER_SLIDE: {
-                // Pure translate: manSprite slides from where the walk left him
-                // to screen-centre X / feet on the screen bottom over
-                // CENTER_SLIDE_SEC. No scale change, no fade — the live scene
-                // video stays up under the waves the whole way.
-                float t = (float)((now - slideStartTime) / CENTER_SLIDE_SEC);
+            case AppState::CENTERING: {
+                // Slide + scale the man to screen-centre while the background
+                // darkening fades in, over CENTER_SLIDE_SEC. darkT drives both
+                // the man's eased progress (see render) and the darkening. Keys
+                // are ignored until it settles onto AUDIENCE_0.
+                float t = (float)((now - centerStartTime) / CENTER_SLIDE_SEC);
                 if (t > 1.f) t = 1.f;
-                const float e = t*t*(3.f - 2.f*t);      // smoothstep
-                Hg_pixel[0][2] = slideStartTx + (slideEndTx - slideStartTx) * e;
-                Hg_pixel[1][2] = slideStartTy + (slideEndTy - slideStartTy) * e;
+                darkT      = t*t*(3.f - 2.f*t);            // smoothstep
+                greenAlpha = GREEN_MAX * darkT;
+                wavesAlpha = 0.5f + (2.0f - 0.5f) * darkT; // 0.5 walking → 2.0 backdrop
                 if (t >= 1.f) {
-                    Hg_pixel[0][2] = slideEndTx;
-                    Hg_pixel[1][2] = slideEndTy;
+                    darkT = 1.f; greenAlpha = GREEN_MAX; wavesAlpha = 2.0f;
+                    stage = 0; stageT = 1.f; stageStartTime = now;
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
-                    appState = AppState::CENTER_HOLD;
+                    appState = AppState::AUDIENCE_0;
                 }
                 break;
             }
 
-            case AppState::CENTER_HOLD: {
-                // Centred man held over the live scene + waves. DOWN begins the
-                // hand-drawn pull-back: the crowd fades up, a green wash lands as
-                // a hard cut, and the waves become the backdrop the camera pulls
-                // out of. The man carries on as the same digital sprite.
-                if (downKeyPressed) {
-                    anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
-                    releaseWalkSequences();     // the walk sprites are behind us
-                    stage = 0;
-                    stageT = 1.f;               // start on the tightest shot (Z0)
-                    stageStartTime = now;
-                    greenAlpha = GREEN_MAX;     // hard cut, not a fade
-                    wavesAlpha = 2.0f;          // waves become the audience backdrop
-                    appState = AppState::HAND_DRAWN;
-                }
-                break;
-            }
-
-            case AppState::HAND_DRAWN:
+            case AppState::AUDIENCE_0:
             case AppState::AUDIENCE_1:
             case AppState::AUDIENCE_2:
             case AppState::AUDIENCE_3: {
-                // Ease the camera into the current stage.
+                // Ease the move into the current level.
                 const bool zooming = (stageT < 1.f);
                 if (zooming) {
                     stageT = (float)((now - stageStartTime) / STAGE_XFADE_SEC);
                     if (stageT >= 1.f) {
                         stageT = 1.f;
-                        // The level we just faded out of will never be shown again.
-                        if (appState == AppState::AUDIENCE_2)      stillAudL1.unload();
-                        else if (appState == AppState::AUDIENCE_3) stillAudL2.unload();
-                        if (appState == AppState::AUDIENCE_3)
-                            audience3EndTime = now + AUDIENCE_3_HOLD_SEC;
                         anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                     }
                 }
+                // Rebuild the crowd's left-receding skew for this eased depth.
+                audSkew = sceneSkew(audLerp(AUD_SKEW));
 
-                // Backdrop pulls back with the camera, in proportion — the
-                // waves shrink by exactly the factor the world does. Updated
-                // mid-zoom too, so the backdrop eases with everything else.
-                wavesScale = WAVES_CENTER_ZOOM * (currentZoom() / stageZoom(0));
-
-                // Keys are ignored until the zoom settles so a fast
-                // double-press can't skip one.
+                // Keys are ignored until the move settles so a fast double-press
+                // can't skip a level.
                 if (zooming) break;
 
-                // The hand-drawn art has no frames to advance any more — its
-                // boil is driven straight off `now`, quantised to HAND_BOIL_HZ.
-
                 if (appState == AppState::AUDIENCE_3) {
-                    // Widest shot: a bug wanders through at random. Roll once a
-                    // second, but only while the previous one has finished, so
-                    // there is never more than one on screen.
+                    // Widest level: a bug wanders through the crowd at random.
+                    // Roll once a second, only while the last one has finished,
+                    // so there is never more than one on screen.
                     if (!bugActive && (now - lastBugRoll) >= BUG_ROLL_SEC) {
                         lastBugRoll = now;
                         if (!seqSmoothBug.frames.empty() && bugRoll(bugRng) < BUG_PROB) {
@@ -2299,7 +2308,7 @@ struct App {
                             // Drop it somewhere in the crowd, inset far enough
                             // that the clip's whole travelled area stays inside.
                             float x0,y0,x1,y1;
-                            audienceRect(stageZoom(3), x0,y0,x1,y1);
+                            audienceRect(x0,y0,x1,y1);
                             x0 += BUG_SCALE*BUG_CONTENT_HX;
                             x1 -= BUG_SCALE*BUG_CONTENT_HX;
                             y0 += BUG_SCALE*BUG_CONTENT_HY;
@@ -2313,12 +2322,14 @@ struct App {
                         seqSmoothBug.advance();
                         if (seqSmoothBug.done) bugActive = false;
                     }
-                    // Any key — or just waiting long enough — heads for the exit.
-                    if (anyKeyPressed || now >= audience3EndTime) {
+                    // Only another DOWN heads for the exit.
+                    if (downKeyPressed) {
                         anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                         beginOutro(now);
                     }
                 } else if (downKeyPressed) {
+                    // DOWN = one zoom-out: shrink the man, deepen the skew and the
+                    // left darkening (all driven off `stage`/`stageT` at render).
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                     ++stage;
                     stageT = 0.f;
@@ -2424,36 +2435,47 @@ struct App {
                 if (appState==AppState::INTRO) {
                     drawTex(prog,quad,introTex);
                 } else {
-                    // Primary background: looping video (station or grass)
-                    drawTex(prog,quad,bgVidTex);
+                    // Primary background: looping video (station or grass).
+                    // Zoomed in over the centering slide and pulled back out
+                    // across the audience levels (scaled about the screen centre).
+                    const float bgZoom = bgZoomNow();
+                    const glm::mat4 bgM = (bgZoom != 1.0f)
+                        ? glm::scale(glm::mat4(1.f), glm::vec3(bgZoom, bgZoom, 1.f))
+                        : glm::mat4(1.f);
+                    drawTex(prog,quad,bgVidTex,bgM);
                     glEnable(GL_BLEND);
 
-                    // Waves overlay — `wavesAlpha` is 0.5 while walking / sliding
-                    // to centre, then 2.0 as the audience backdrop. progOverlay's
-                    // threshold-amplify shader saturates wave regions to fully
-                    // opaque at 2.0 while keeping the PNG's transparent regions
-                    // transparent. Shown from the slide through the whole audience
-                    // pull-back, but NOT during the exit (OUTRO) — that is clean black.
-                    bool wavesActive = showWavesOverlay
-                        || appState==AppState::CENTER_SLIDE
-                        || appState==AppState::CENTER_HOLD
-                        || appState==AppState::HAND_DRAWN
+                    const bool inAudience =
+                           appState==AppState::AUDIENCE_0
                         || appState==AppState::AUDIENCE_1
                         || appState==AppState::AUDIENCE_2
                         || appState==AppState::AUDIENCE_3;
-                    // Scaled about the screen centre: the backdrop pushes in at
-                    // the hand-drawn cut and pulls back with each zoom-out, in step
-                    // with the camera. wavesScale never drops below 1, so the
-                    // texture always covers the frame.
-                    if (wavesActive && bgTex) {
-                        const float ws = wavesScale;
-                        const glm::mat4 wm = (ws == 1.f) ? glm::mat4(1.f)
-                            : rectMatrix((float)cfg::WIN_W * 0.5f * (1.f - ws),
-                                         (float)cfg::WIN_H * 0.5f * (1.f - ws),
-                                         (float)cfg::WIN_W * ws,
-                                         (float)cfg::WIN_H * ws);
-                        drawTex(progOverlay,quad,bgTex,wm,wavesAlpha);
+                    // The centering slide darkens on the way in; the audience holds
+                    // it. darkT (0→1) ramps everything during CENTERING and is 1
+                    // through the audience, so there is no hard cut.
+                    const bool darkScene = inAudience || appState==AppState::CENTERING;
+
+                    // A flat dark layer over the looping video (the "darkened
+                    // background"), under the waves, faded in by darkT.
+                    if (darkScene && darkT > 0.f) {
+                        glUseProgram(progPlain);
+                        glUniformMatrix4fv(glGetUniformLocation(progPlain,"uModel"),
+                                           1,GL_FALSE,glm::value_ptr(glm::mat4(1.f)));
+                        glm::vec4 dark(0.f,0.f,0.f,AUD_DARK_BG*darkT);
+                        glUniform4fv(glGetUniformLocation(progPlain,"uColor"),
+                                     1,glm::value_ptr(dark));
+                        quad.draw();
                     }
+
+                    // Waves overlay — `wavesAlpha` is 0.5 while walking, ramps to
+                    // 2.0 across the centering slide, then holds as the audience
+                    // backdrop. progOverlay's threshold-amplify shader saturates
+                    // wave regions to fully opaque at 2.0 while keeping the PNG's
+                    // transparent regions transparent. Shown through the audience,
+                    // but NOT the exit (OUTRO) — clean black.
+                    bool wavesActive = showWavesOverlay || darkScene;
+                    if (wavesActive && bgTex)
+                        drawTex(progOverlay,quad,bgTex,glm::mat4(1.f),wavesAlpha);
                 }
 
                 // ── Debug placeholder helper ──────────────────────────────────
@@ -2480,72 +2502,62 @@ struct App {
                         drawPlaceholder({0.2f,0.8f,0.2f,0.4f},spriteMatrix);
                     break;
 
-                // Slide: manSprite drawn by the live (translation-only) sprite
-                // matrix as it moves to centre.
-                case AppState::CENTER_SLIDE:
-                    drawTex(prog,quad,manSprite.current(),spriteMatrix);
+                // ── Centering slide ───────────────────────────────────────────
+                // The man translates + scales from where the walk left him to the
+                // level-0 audience pose (screen-centre, feet on the bottom), eased
+                // by darkT. The end pose is exactly AUDIENCE_0's manAudRect, so the
+                // handoff into the audience is seamless. No crowd yet.
+                case AppState::CENTERING:
+                    if (manSprite.loaded) {
+                        const float sc = centerStartScale
+                                       + (MAN_AUD_SCALE[0] - centerStartScale)*darkT;
+                        const float cx = centerStartCX
+                                       + (MAN_AUD_X[0]     - centerStartCX)*darkT;
+                        const float by = centerStartBY
+                                       + ((float)cfg::WIN_H - centerStartBY)*darkT;
+                        drawTex(prog, quad, manSprite.current(), manRectAt(sc, cx, by));
+                    }
                     break;
 
-                // Hold: draw manSprite through the camera model at the tightest
-                // shot (Z0) — identical pixels to the slide's end, and to the
-                // first HAND_DRAWN frame, so both transitions are seamless.
-                case AppState::CENTER_HOLD:
-                    drawTex(prog,quad,manSprite.current(),manRectMatrix(stageZoom(0)));
-                    break;
-
-                // ── Hand-drawn pull-back ─────────────────────────────────────
-                // One camera zoom Z drives the whole shot. The audience levels
-                // are nested crops sharing a bottom-left world origin, so a
-                // cross-fade between two of them moves nothing that both draw —
-                // only the ink of the newly revealed rows fades up.
-                case AppState::HAND_DRAWN:
+                // ── Audience ─────────────────────────────────────────────────
+                // Fixed-size framing: the crowd is revealed level by level (fade +
+                // recede, drawAudience folds in the current left-receding skew),
+                // the man drifts left and shrinks, and a left darkening gradient
+                // deepens with depth. Level 0 shows no crowd (alpha 0).
+                case AppState::AUDIENCE_0:
                 case AppState::AUDIENCE_1:
                 case AppState::AUDIENCE_2:
                 case AppState::AUDIENCE_3: {
-                    const float Z = currentZoom();
-                    const float t = stageT*stageT*(3.f-2.f*stageT);   // smoothstep
+                    const float crowdA = audLerp(AUD_CROWD_ALPHA);
+                    // Crowd (skewed): near figures, the bug between, far rows.
+                    drawAudience(stillAudL3Back, crowdA, now);
+                    if (bugActive)
+                        if (GLuint bugTx = seqSmoothBug.current())
+                            drawTex(prog, quad, bugTx,
+                                    audSkew * rectMatrix(bugPosX - BUG_SCALE*BUG_CONTENT_CX,
+                                                         bugPosY - BUG_SCALE*BUG_CONTENT_CY,
+                                                         BUG_SCALE*(float)cfg::WIN_W,
+                                                         BUG_SCALE*(float)cfg::WIN_H),
+                                    BUG_ALPHA);
+                    drawAudience(stillAudL3Front, crowdA, now);
 
-                    // Outgoing level fades out, incoming fades in. Level 3 is
-                    // split so the bug can sit between its near and far ink.
-                    if (appState==AppState::AUDIENCE_2 || appState==AppState::AUDIENCE_3)
-                        drawAudience(appState==AppState::AUDIENCE_2 ? stillAudL1 : stillAudL2,
-                                     Z, 1.f - t, now);
-                    if (appState==AppState::AUDIENCE_1)
-                        drawAudience(stillAudL1, Z, t, now);
-                    else if (appState==AppState::AUDIENCE_2)
-                        drawAudience(stillAudL2, Z, t, now);
-                    else if (appState==AppState::AUDIENCE_3) {
-                        drawAudience(stillAudL3Back, Z, t, now);
-                        if (bugActive)
-                            if (GLuint bugTx = seqSmoothBug.current())
-                                drawTex(prog, quad, bugTx,
-                                        rectMatrix(bugPosX - BUG_SCALE*BUG_CONTENT_CX,
-                                                   bugPosY - BUG_SCALE*BUG_CONTENT_CY,
-                                                   BUG_SCALE*(float)cfg::WIN_W,
-                                                   BUG_SCALE*(float)cfg::WIN_H),
-                                        BUG_ALPHA);
-                        drawAudience(stillAudL3Front, Z, t, now);
-                    }
-
-                    // The man draws last of the scene: never occluded by the
-                    // crowd. He is the same digital sprite as CENTER_HOLD, placed
-                    // through the camera model — native at the tightest shot,
-                    // shrinking with the zoom-out. Plain: no boil, no tint.
+                    // The man: digital sprite, upright (not skewed), drifting left
+                    // and shrinking a little more each step back.
                     if (manSprite.loaded)
-                        drawTex(prog, quad, manSprite.current(), manRectMatrix(Z));
+                        drawTex(prog, quad, manSprite.current(),
+                                manAudRect(audLerp(MAN_AUD_SCALE), audLerp(MAN_AUD_X)));
 
-                    // Depth darkening: a black gradient, clear at the left edge
-                    // and darkest at the right, deepening with each audience level
-                    // (see gradRightAlpha). Over the whole scene, under the wash.
+                    // Depth darkening: a black gradient darkest at the LEFT edge
+                    // (the far side) and clear at the right, deepening each level.
                     {
-                        const float ra = gradRightAlpha();
-                        if (ra > 0.f) {
+                        const float la = audLerp(AUD_LEFT_DARK);
+                        if (la > 0.f) {
                             glUseProgram(progHGrad);
                             glUniformMatrix4fv(glGetUniformLocation(progHGrad,"uModel"),
                                                1,GL_FALSE,glm::value_ptr(glm::mat4(1.f)));
                             glUniform3f(glGetUniformLocation(progHGrad,"uColor"),0.f,0.f,0.f);
-                            glUniform1f(glGetUniformLocation(progHGrad,"uLeftA"),0.f);
-                            glUniform1f(glGetUniformLocation(progHGrad,"uRightA"),ra);
+                            glUniform1f(glGetUniformLocation(progHGrad,"uLeftA"),la);
+                            glUniform1f(glGetUniformLocation(progHGrad,"uRightA"),0.f);
                             quad.draw();
                         }
                     }
