@@ -374,6 +374,8 @@ uniform sampler2D uTex; uniform float uAlpha; uniform vec3 uTint;
 uniform vec2  uBoilAmp;
 uniform vec2  uBoilCells;
 uniform float uBoilSeed;
+uniform float uUScale;   // horizontal crop: the quad's u=0..1 samples texture u=0..uUScale
+uniform float uFadeFrac; // soft fade to transparent over the rightmost uFadeFrac of the quad
 float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
 float vnoise(vec2 p){
     vec2 i=floor(p), f=fract(p);
@@ -384,7 +386,12 @@ float vnoise(vec2 p){
 void main(){
     vec2 q = vUV * uBoilCells + uBoilSeed;
     vec2 d = (vec2(vnoise(q), vnoise(q + 37.0)) - 0.5) * 2.0 * uBoilAmp;
-    frag = vec4(uTint, texture(uTex, vUV + d).a * uAlpha);
+    vec2 uv = vec2(vUV.x * uUScale, vUV.y);
+    // Feather the right edge so a cut that can't land on a clean member gap
+    // dissolves into the dark instead of showing a hard partial figure.
+    float edge = (uFadeFrac > 0.0)
+               ? 1.0 - smoothstep(1.0 - uFadeFrac, 1.0, vUV.x) : 1.0;
+    frag = vec4(uTint, texture(uTex, uv + d).a * uAlpha * edge);
 })glsl";
 
 // Flat-tint line art: keep the PNG's alpha (which carries the antialiased
@@ -397,6 +404,22 @@ static const char* FS_TINT = R"glsl(
 in vec2 vUV; out vec4 frag;
 uniform sampler2D uTex; uniform float uAlpha; uniform vec3 uTint;
 void main(){ frag = vec4(uTint, texture(uTex, vUV).a * uAlpha); })glsl";
+
+// Luma-keyed flat tint: the audience "cut" clips ship as opaque black-ink-on-white
+// video (h264, no alpha), so derive the stroke from luma — dark ink → opaque,
+// white paper → transparent — and recolour to uTint. The smoothstep threshold
+// ignores the faint grey ringing h264 leaves around the lines so the edge stays
+// crisp rather than haloed.
+static const char* FS_LUMA_TINT = R"glsl(
+#version 330 core
+in vec2 vUV; out vec4 frag;
+uniform sampler2D uTex; uniform float uAlpha; uniform vec3 uTint;
+void main(){
+    vec3 c = texture(uTex, vUV).rgb;
+    float luma = dot(c, vec3(0.299, 0.587, 0.114));
+    float ink  = 1.0 - smoothstep(0.40, 0.85, luma);
+    frag = vec4(uTint, ink * uAlpha);
+})glsl";
 
 // Font atlas — red channel drives alpha, glyphs tinted by uColor (default white)
 static const char* FS_TEXT = R"glsl(
@@ -495,7 +518,8 @@ static void drawTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
 // Cells are sized off the same rect to hold the calibrated ~60 px cell.
 static void drawBoiledTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
                              float rectW, float rectH, float boilPx, float seed,
-                             const glm::vec3& tint, float alpha=1.f) {
+                             const glm::vec3& tint, float alpha=1.f,
+                             float uScaleX=1.f, float uFade=0.f) {
     if (!tex || rectW <= 0.f || rectH <= 0.f) return;
     glUseProgram(prog);
     glUniform3fv(glGetUniformLocation(prog,"uTint"),1,glm::value_ptr(tint));
@@ -503,6 +527,8 @@ static void drawBoiledTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& 
     glUniform2f(glGetUniformLocation(prog,"uBoilCells"),
                 std::max(2.f, rectW/60.f), std::max(2.f, rectH/60.f));
     glUniform1f(glGetUniformLocation(prog,"uBoilSeed"), seed);
+    glUniform1f(glGetUniformLocation(prog,"uUScale"), uScaleX);
+    glUniform1f(glGetUniformLocation(prog,"uFadeFrac"), uFade);
     drawTex(prog, q, tex, M, alpha);
 }
 
@@ -1162,6 +1188,7 @@ struct App {
     GLuint      progHGrad = 0;   // horizontal alpha gradient — audience darkening
     GLuint      progBoilTint = 0;// hand-drawn line wobble, recoloured — the crowd
     GLuint      progTint  = 0;   // textured quad, alpha kept, colour replaced
+    GLuint      progLumaTint = 0;// opaque black-on-white video → tinted ink (audience cuts)
     Quad        quad;
 
     TitleScreen title;
@@ -1308,48 +1335,52 @@ struct App {
     static constexpr double OUTRO_FRAME_SEC   = 1.0/24.0;  // bug clip ~24 fps
     static constexpr float  EXIT_AUDIO_GAIN   = 0.5f;      // exit recording volume
 
-    // ── Hand-drawn pull-back (AUDIENCE_0 → AUDIENCE_1/2/3) ───────────────────
-    // The audience crowd is one hand-drawn still, pre-split by boil_stills.py
-    // into the near figures (l3_back) and the receding rows (l3_front) so the
-    // bug clip can be drawn between them. Boiled by FS_BOIL_TINT at 20 fps (they
-    // were 100-frame loops that measured as one drawing being redrawn — p90 1 px).
-    BoilStill stillAudL3Back, stillAudL3Front;
-    static constexpr double HAND_BOIL_HZ = 20.0;   // re-settle rate, was the loop cadence
-    static constexpr float  HAND_BOIL_PX = 1.0f;   // p90 line displacement, measured
+    // ── Audience reveal (AUDIENCE_0 → 1 → 2 → 3) ─────────────────────────────
+    // The crowd is three pre-drawn "cut" clips, one per level — nested crops of
+    // the same drawing that reveal more of the receding audience each step back
+    // (L1 = the near figures, L3 = the full crowd, with the cut baked in so no
+    // figure is ever sliced). Each is 100 frames of baked hand-drawn boil at
+    // 20 fps, opaque black-ink-on-white, keyed + recoloured white at draw time
+    // (progLumaTint). Level 0 shows no crowd; a DOWN cross-fades to the next clip.
+    SpriteSeq seqAudL1, seqAudL2, seqAudL3;
+    double    lastCrowdTime = 0.0;
+    static constexpr double CROWD_FRAME_SEC = 1.0/20.0;   // the clips are 20 fps
 
-    // The audience section is a fixed-size framing (no camera zoom): the crowd
-    // fills a rect on the right, the man stands on the left. The sense of
-    // "stepping back" comes not from scaling the world but, one step per DOWN
-    // (indexed by `stage`, eased by stageT), from revealing more of the crowd
-    // (fade + recede + deepening skew), drifting the man left and shrinking him,
-    // and darkening the left. AUD_WORLD_* place the crowd via drawAudience at the
-    // level-3 framing: the bottom-left corner at x=480, the crop spanning 480 →
-    // 1920. Earlier levels shrink + offset it off that anchor (AUD_CROWD_*).
-    static constexpr float AUD_WORLD_X     = 480.0f;
+    // The crowd's right edge is pinned near the RIGHT corner: its right edge sits at
+    // the eased AUD_RIGHT_X[stage] on the screen bottom, drawn at AUD_WORLD_SCALE ×
+    // the per-level AUD_CROWD_SCALE. A wider level extends further LEFT (revealing
+    // more of the audience toward the man). Level 1 is inset ~200 px from the corner
+    // (the small first crowd isn't jammed in); the wider levels fill to the corner.
+    static constexpr float AUD_RIGHT_X[4]  = { 1720.0f, 1720.0f, 1920.0f, 1920.0f };
     static constexpr float AUD_WORLD_SCALE = 1.033000f;
     // The man: a static digital sprite, centroid at MAN_AUD_X[stage], feet on the
-    // screen bottom. He lands slightly left of centre (level 0, even before any
-    // crowd), then drifts gently further left and shrinks a touch as the crowd is
-    // revealed — small, even steps so the moves between levels stay subtle and he
-    // ends up fairly large and close to the audience rather than tiny and far off.
-    static constexpr float MAN_AUD_X[4]     = { 820.0f, 720.0f, 640.0f, 580.0f };
-    static constexpr float MAN_AUD_SCALE[4] = { 0.92f, 0.88f, 0.85f, 0.82f };
-    // Per-level scene effects, eased between levels by stageT (see audLerp):
-    static constexpr float AUD_SKEW[4]      = { 0.00f, 0.14f, 0.26f, 0.38f }; // left-recede
-    static constexpr float AUD_LEFT_DARK[4] = { 0.10f, 0.25f, 0.40f, 0.55f }; // left gradient
+    // screen bottom. Level 0: WALK size (scale 1), left of centre, no crowd. Then he
+    // shrinks and slides left more each zoom-out, staying clear of (a little farther
+    // from) the crowd, ending small on the left as the crowd fills in from the right.
+    static constexpr float MAN_AUD_X[4]     = { 800.0f, 650.0f, 480.0f, 400.0f };
+    static constexpr float MAN_AUD_SCALE[4] = { 1.00f, 0.92f, 0.80f, 0.70f };
+    // Per-level scene effects, eased between levels by stageT (see audLerp). A gentle
+    // left-receding skew deepens as the crowd recedes (the clips already carry drawn
+    // perspective; this adds a touch more).
+    static constexpr float AUD_SKEW[4]      = { 0.00f, 0.00f, 0.05f, 0.10f }; // left-recede
+    static constexpr float AUD_LEFT_DARK[4] = { 0.10f, 0.20f, 0.30f, 0.40f }; // left gradient
     static constexpr float AUD_DARK_BG      = 0.35f;   // flat darken over the video
-    // Crowd reveal, per level: hidden at level 0, then faded up while it recedes
-    // (scales down) and slides up-and-in from the lower-right, so each step back
-    // shows more of the audience. Eased by audLerp like everything else.
-    static constexpr float AUD_CROWD_ALPHA[4] = { 0.00f, 0.60f, 0.85f, 1.00f };
-    static constexpr float AUD_CROWD_SCALE[4] = { 1.35f, 1.20f, 1.08f, 1.00f };
-    static constexpr float AUD_CROWD_DX[4]    = { 260.0f, 150.0f,  60.0f, 0.0f };
-    static constexpr float AUD_CROWD_DY[4]    = { 220.0f, 120.0f,  45.0f, 0.0f };
+    // Per-level crowd scale (× AUD_WORLD_SCALE). Index [0] is the (larger) size the
+    // level-1 clip fades in FROM; [1..3] are the settled sizes, tuned so the near
+    // figures (~328 px in the clip) sit just a hair above the man (~463 px ×
+    // MAN_AUD_SCALE) — only slightly larger — and shrink with him as the crowd
+    // recedes. The reveal eases the incoming clip from the previous level's size
+    // down to its own (see render), so it fades in "outwards-in" over the previous.
+    static constexpr float AUD_CROWD_SCALE[4] = { 1.35f, 1.25f, 1.15f, 1.00f };
+    // The outro voice recording is mixed in UNDER the audience as a rising overlay:
+    // each zoom-out brings it up, until the exit itself plays it at full volume.
+    // Eased by audLerp; used as mixer.bgGain2 while exitAudio is the 2nd source.
+    static constexpr float AUD_EXIT_GAIN[4]   = { 0.00f, 0.25f, 0.50f, 0.80f };
     // Background video zoom, per level: the centering slide pushes the camera IN
     // (bg magnifies to BG_ZOOM[0]); each step back pulls it OUT with the man and
     // crowd, settling at 1.0 (full frame) by the widest level. Scaled about the
     // screen centre in NDC. See bgZoomNow().
-    static constexpr float BG_ZOOM[4]         = { 1.50f, 1.32f, 1.16f, 1.00f };
+    static constexpr float BG_ZOOM[4]         = { 2.00f, 1.60f, 1.28f, 1.00f };
     glm::mat4 audSkew{1.f};   // current left-receding perspective, rebuilt each frame
 
     // ── Centering transition (walk → AUDIENCE_0) ─────────────────────────────
@@ -1729,38 +1760,54 @@ struct App {
         // returns 0 and drawTex early-outs, which is safer than nulling them.
     }
 
-    // Un-skewed screen rect the crowd fills at the current (eased) reveal level:
-    // the level-3 anchor is bottom-left at AUD_WORLD_X, bottom row on the screen
-    // bottom, crop spanning 480 → 1920. Earlier levels are larger (closer) and
-    // offset down/right (AUD_CROWD_SCALE/DX/DY), so stepping back recedes the
-    // crowd into full view. Shared by drawAudience and the bug-bounds helper.
-    void crowdRect(float w0, float h0, float& x0, float& y0, float& w, float& h) const {
-        const float cScale = AUD_WORLD_SCALE * audLerp(AUD_CROWD_SCALE);
-        w = cScale * w0;
-        h = cScale * h0;
-        x0 = AUD_WORLD_X          + audLerp(AUD_CROWD_DX);
-        y0 = (float)cfg::WIN_H - h + audLerp(AUD_CROWD_DY);
+    // Settled screen rect a crowd clip fills at the current (eased) reveal level:
+    // right edge pinned to AUD_RIGHT_X on the screen bottom, drawn at
+    // AUD_WORLD_SCALE times the eased per-level AUD_CROWD_SCALE — so the right
+    // corner always sits at the edge and a wider level extends further left. The
+    // per-transition slide-in offset is applied on top in drawCrowdLevel, not here
+    // (so the bug bounds track the settled rect). Shared with audienceRect.
+    void crowdRect(float w0, float h0, float scaleMul,
+                   float& x0, float& y0, float& w, float& h) const {
+        const float cScale = AUD_WORLD_SCALE * scaleMul;
+        w  = cScale * w0;
+        h  = cScale * h0;
+        x0 = audLerp(AUD_RIGHT_X) - w;
+        y0 = (float)cfg::WIN_H - h;
     }
 
-    // Draw a crowd layer at the current reveal framing, folding in the current
-    // left-receding skew. alpha is the eased per-level crowd opacity.
-    void drawAudience(BoilStill& still, float alpha, double now) {
-        if (!still.loaded || alpha <= 0.f) return;
+    // The crowd clip for a level (1..3); nullptr for level 0 (no crowd yet).
+    SpriteSeq* crowdSeq(int lvl) {
+        switch (lvl) {
+            case 1:  return &seqAudL1;
+            case 2:  return &seqAudL2;
+            case 3:  return &seqAudL3;
+            default: return nullptr;
+        }
+    }
+
+    // Draw one level's crowd clip at a given crowd scale (× AUD_WORLD_SCALE),
+    // luma-keyed + recoloured white, right-corner pinned. The baked frames are the
+    // boil; the current frame is picked by the 20 fps crowd timer. alpha drives the
+    // cross-fade.
+    void drawCrowdLevel(int lvl, float alpha, float scaleMul) {
+        if (alpha <= 0.f) return;
+        SpriteSeq* s = crowdSeq(lvl);
+        if (!s || !s->loaded) return;
+        GLuint tx = s->current();
+        if (!tx) return;
         float x0, y0, w, h;
-        crowdRect(still.w, still.h, x0, y0, w, h);
-        drawBoiledTinted(progBoilTint, quad, still.current(),
-                         audSkew * rectMatrix(x0, y0, w, h),
-                         w, h, HAND_BOIL_PX,
-                         (float)std::floor(now*HAND_BOIL_HZ), audTint, alpha);
+        crowdRect((float)s->texW, (float)s->texH, scaleMul, x0, y0, w, h);
+        drawTinted(progLumaTint, quad, tx,
+                   audSkew * rectMatrix(x0, y0, w, h), audTint, alpha);
     }
 
-    // Fixed (un-skewed) screen rect the crowd fills; used to keep the bug inside.
-    // Tracks the same eased reveal framing as drawAudience.
+    // Fixed screen rect the widest crowd (level 3) fills; used to keep the bug
+    // inside the crowd.
     void audienceRect(float& x0, float& y0, float& x1, float& y1) const {
-        const float w0 = stillAudL3Front.w ? stillAudL3Front.w : 1394;
-        const float h0 = stillAudL3Front.h ? stillAudL3Front.h : 748;
+        const float w0 = seqAudL3.texW ? seqAudL3.texW : 1394;
+        const float h0 = seqAudL3.texH ? seqAudL3.texH : 748;
         float w, h;
-        crowdRect(w0, h0, x0, y0, w, h);
+        crowdRect(w0, h0, audLerp(AUD_CROWD_SCALE), x0, y0, w, h);
         x1 = x0 + w;
         y1 = y0 + h;
     }
@@ -1772,27 +1819,33 @@ struct App {
         // Nothing but the exit drawing is on screen from here, so the crowd,
         // the bug and the man all go.
         manSprite.unload();
-        stillAudL3Back.unload(); stillAudL3Front.unload();
+        seqAudL1.unload(); seqAudL2.unload(); seqAudL3.unload();
         seqSmoothBug.unload();
         seqBg.unload();          // waves overlay is deliberately absent here
         bgTex = 0;
         bugActive = false;
 
-        exitAudio.audioPos = 0;
+        // The outro voice has been building UNDER the audience (mixer.vidSrc2)
+        // since the first zoom-out. Promote it to the sole source and CONTINUE
+        // from where it is — no restart — so it flows straight from the build-up
+        // into the exit at full volume. The exit animation is spread over whatever
+        // of the recording remains.
+        const double perSec = (double)(cfg::AUDIO_CH * cfg::AUDIO_RATE);
+        const double bufSec = exitAudio.audioBuf.empty() ? 0.0
+                            : (double)exitAudio.audioBuf.size() / perSec;
+        double remaining = bufSec - (double)exitAudio.audioPos.load() / perSec;
+        if (remaining < 1.0) {           // barely any left (lingered / looped) — restart clean
+            exitAudio.audioPos = 0;
+            remaining = bufSec;
+        }
+        if (remaining <= 0.0) remaining = (double)seqExit.frames.size() * OUTRO_FRAME_SEC;
         mixer.vidSrc  = &exitAudio;
         mixer.vidSrc2 = nullptr;
-        mixer.bgGain.store(EXIT_AUDIO_GAIN);
-        // Run until the recording finishes, and spread the exit frames evenly
-        // across it so the animation lasts the whole way rather than cutting to
-        // black early.
-        double dur = exitAudio.audioBuf.empty() ? 0.0
-            : (double)exitAudio.audioBuf.size()
-              / (double)(cfg::AUDIO_CH * cfg::AUDIO_RATE);
-        if (dur <= 0.0) dur = (double)seqExit.frames.size() * OUTRO_FRAME_SEC;
+        mixer.bgGain.store(1.0f);        // full volume for the exit itself
         exitFrameSec = seqExit.frames.empty()
-            ? OUTRO_FRAME_SEC : dur / (double)seqExit.frames.size();
+            ? OUTRO_FRAME_SEC : remaining / (double)seqExit.frames.size();
         lastExitFrameTime = now;
-        outroEndTime      = now + dur;
+        outroEndTime      = now + remaining;
         appState          = AppState::OUTRO;
     }
 
@@ -1952,6 +2005,7 @@ struct App {
         progHGrad   = makeProgram(VS_SRC,   FS_HGRAD);
         progBoilTint= makeProgram(VS_SRC,   FS_BOIL_TINT);
         progTint    = makeProgram(VS_SRC,   FS_TINT);
+        progLumaTint= makeProgram(VS_SRC,   FS_LUMA_TINT);
         quad.init();
 
         title.load(progText);
@@ -2041,10 +2095,14 @@ struct App {
             manCentroidX = manSprite.w * 0.5f;
             manBottomY   = (float)manSprite.h;
         }
-        if (!stillAudL3Back.load("renders/stills/aud_l3_back.png"))
-            std::cerr<<"[aud] No renders/stills/aud_l3_back.png (run boil_stills.py)\n";
-        if (!stillAudL3Front.load("renders/stills/aud_l3_front.png"))
-            std::cerr<<"[aud] No renders/stills/aud_l3_front.png (run boil_stills.py)\n";
+        // Per-level audience "cut" clips (opaque black-on-white; luma-keyed at
+        // draw time). 100 frames each, 20 fps, nested crops L1⊂L2⊂L3.
+        if (!seqAudL1.loadVideo("renders/seq/audience_l1.mp4",/*wantAlpha=*/false))
+            std::cerr<<"[aud] No renders/seq/audience_l1.mp4\n";
+        if (!seqAudL2.loadVideo("renders/seq/audience_l2.mp4",/*wantAlpha=*/false))
+            std::cerr<<"[aud] No renders/seq/audience_l2.mp4\n";
+        if (!seqAudL3.loadVideo("renders/seq/audience_l3.mp4",/*wantAlpha=*/false))
+            std::cerr<<"[aud] No renders/seq/audience_l3.mp4\n";
 
         // Bug clip frames — played during AUDIENCE_3. Still the full 1920×1080
         // frame, so BUG_CONTENT_* below stay valid.
@@ -2119,6 +2177,19 @@ struct App {
                 lastAntTime = now;
                 if (seqAnts.done) seqAnts.reset();
                 seqAnts.advance();
+            }
+            // Loop the audience "cut" clips at their 20 fps through the whole
+            // audience section (and the centering slide it settles from), so the
+            // baked hand-drawn boil keeps moving. All three cycle together.
+            {
+                const bool crowdOn =
+                       appState==AppState::CENTERING
+                    || appState==AppState::AUDIENCE_0 || appState==AppState::AUDIENCE_1
+                    || appState==AppState::AUDIENCE_2 || appState==AppState::AUDIENCE_3;
+                if (crowdOn && (now - lastCrowdTime) >= CROWD_FRAME_SEC) {
+                    lastCrowdTime = now;
+                    seqAudL1.advanceLoop(); seqAudL2.advanceLoop(); seqAudL3.advanceLoop();
+                }
             }
 
             // ── State machine ─────────────────────────────────────────────────
@@ -2290,6 +2361,10 @@ struct App {
                 }
                 // Rebuild the crowd's left-receding skew for this eased depth.
                 audSkew = sceneSkew(audLerp(AUD_SKEW));
+                // Bring the outro voice up under the audience — louder each level
+                // — so it is already swelling by the time the exit plays. Only has
+                // effect once the overlay is armed (first zoom-out, below).
+                mixer.bgGain2.store(audLerp(AUD_EXIT_GAIN));
 
                 // Keys are ignored until the move settles so a fast double-press
                 // can't skip a level.
@@ -2328,12 +2403,20 @@ struct App {
                         beginOutro(now);
                     }
                 } else if (downKeyPressed) {
-                    // DOWN = one zoom-out: shrink the man, deepen the skew and the
-                    // left darkening (all driven off `stage`/`stageT` at render).
+                    // DOWN = one zoom-out: reveal more crowd, shrink the man, and
+                    // bring the outro voice up (all driven off `stage`/`stageT`).
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                     ++stage;
                     stageT = 0.f;
                     stageStartTime = now;
+                    // First zoom-out arms the outro-voice overlay from its start;
+                    // it plays under the audience (rising with AUD_EXIT_GAIN) and is
+                    // promoted to the sole source, mid-recording, when the exit plays.
+                    if (stage == 1) {
+                        exitAudio.audioPos = 0;
+                        mixer.vidSrc2 = &exitAudio;
+                        mixer.bgGain2.store(AUD_EXIT_GAIN[0]);
+                    }
                     appState = (stage == 1) ? AppState::AUDIENCE_1
                              : (stage == 2) ? AppState::AUDIENCE_2
                                             : AppState::AUDIENCE_3;
@@ -2520,17 +2603,27 @@ struct App {
                     break;
 
                 // ── Audience ─────────────────────────────────────────────────
-                // Fixed-size framing: the crowd is revealed level by level (fade +
-                // recede, drawAudience folds in the current left-receding skew),
-                // the man drifts left and shrinks, and a left darkening gradient
-                // deepens with depth. Level 0 shows no crowd (alpha 0).
+                // The crowd is revealed level by level: each DOWN cross-fades from
+                // the previous level's "cut" clip to the next (wider) one, the man
+                // drifts left and shrinks, and a left darkening gradient deepens.
+                // Level 0 shows no crowd.
                 case AppState::AUDIENCE_0:
                 case AppState::AUDIENCE_1:
                 case AppState::AUDIENCE_2:
                 case AppState::AUDIENCE_3: {
-                    const float crowdA = audLerp(AUD_CROWD_ALPHA);
-                    // Crowd (skewed): near figures, the bug between, far rows.
-                    drawAudience(stillAudL3Back, crowdA, now);
+                    // Reveal "outwards-in": the previous section holds at its settled
+                    // size and fades out, while the new section fades in starting at
+                    // that same (larger) size and easing down to its own real size —
+                    // so it grows in over the previous, then recedes to settle. Both
+                    // right-corner pinned.
+                    const float e = stageT * stageT * (3.f - 2.f * stageT);
+                    if (stage >= 1) {
+                        if (stage - 1 >= 1)
+                            drawCrowdLevel(stage - 1, 1.f - e, AUD_CROWD_SCALE[stage - 1]);
+                        drawCrowdLevel(stage, (stageT < 1.f) ? e : 1.f,
+                                       audLerp(AUD_CROWD_SCALE));
+                    }
+                    // The bug crawls over the crowd at the widest level.
                     if (bugActive)
                         if (GLuint bugTx = seqSmoothBug.current())
                             drawTex(prog, quad, bugTx,
@@ -2539,10 +2632,9 @@ struct App {
                                                          BUG_SCALE*(float)cfg::WIN_W,
                                                          BUG_SCALE*(float)cfg::WIN_H),
                                     BUG_ALPHA);
-                    drawAudience(stillAudL3Front, crowdA, now);
 
-                    // The man: digital sprite, upright (not skewed), drifting left
-                    // and shrinking a little more each step back.
+                    // The man: digital sprite, upright, drifting left and shrinking
+                    // a little more each step back.
                     if (manSprite.loaded)
                         drawTex(prog, quad, manSprite.current(),
                                 manAudRect(audLerp(MAN_AUD_SCALE), audLerp(MAN_AUD_X)));
