@@ -84,6 +84,55 @@ namespace cfg {
 }
 
 // ============================================================================
+// OFFSCREEN RENDER MODE
+// ============================================================================
+// --render turns the piece into a film instead of a thing you play: a virtual
+// clock in place of glfwGetTime(), a script in place of the keyboard, RGB
+// frames on stdout, and the mixer run by hand into a wav. It is the only way
+// to capture this without a screen recorder, since the window is fullscreen
+// and the audio never leaves the machine.
+//
+// Nothing below is reached unless --render is passed; interactive playback
+// takes exactly the paths it always did.
+namespace rnd {
+    bool   on    = false;
+    double fps   = 60.0;
+    double clock = 0.0;          // virtual seconds since the first frame
+    double maxSec = 0.0;         // hard stop, 0 = run to the outro's own end
+    FILE*  wav   = nullptr;      // pcm_f32le, header patched on close
+    long   wavSamples = 0;
+
+    // Real time while playing, virtual time while rendering. Every scene in the
+    // piece is driven off this, so the film advances a clean 1/fps per frame no
+    // matter how long a frame actually took to draw.
+    inline double now() { return on ? clock : glfwGetTime(); }
+
+    inline void wavOpen(const char* path) {
+        wav = fopen(path, "wb");
+        if (!wav) { std::cerr << "[render] cannot write " << path << "\n"; return; }
+        unsigned char hdr[44] = {0};      // patched in wavClose once size is known
+        fwrite(hdr, 1, 44, wav);
+    }
+
+    inline void wavClose() {
+        if (!wav) return;
+        auto u32=[&](long v){ unsigned char b[4]={(unsigned char)(v&0xff),
+            (unsigned char)((v>>8)&0xff),(unsigned char)((v>>16)&0xff),
+            (unsigned char)((v>>24)&0xff)}; fwrite(b,1,4,wav); };
+        auto u16=[&](int v){ unsigned char b[2]={(unsigned char)(v&0xff),
+            (unsigned char)((v>>8)&0xff)}; fwrite(b,1,2,wav); };
+        const long bytes = wavSamples * cfg::AUDIO_CH * 4;
+        fseek(wav, 0, SEEK_SET);
+        fwrite("RIFF",1,4,wav);  u32(36+bytes);  fwrite("WAVEfmt ",1,8,wav);
+        u32(16); u16(3); u16(cfg::AUDIO_CH);            // 3 = IEEE float
+        u32(cfg::AUDIO_RATE); u32(cfg::AUDIO_RATE*cfg::AUDIO_CH*4);
+        u16(cfg::AUDIO_CH*4); u16(32);
+        fwrite("data",1,4,wav);  u32(bytes);
+        fclose(wav); wav=nullptr;
+    }
+}
+
+// ============================================================================
 // HOMOGRAPHY TRANSFORM
 // ============================================================================
 // H maps Frame-A pixels → Frame-C pixels (one full L+R cycle).
@@ -1028,47 +1077,56 @@ struct AudioMixer {
     std::atomic<float>   bgGain{1.0f};        // multiplies the vidSrc audio
     std::atomic<float>   bgGain2{1.0f};       // multiplies vidSrc2 audio
 
-    static void callback(ma_device* dev, void* out, const void*, ma_uint32 frames) {
-        auto*  self=static_cast<AudioMixer*>(dev->pUserData);
-        float* dst =static_cast<float*>(out);
+    // The whole mix, as a plain function of mixer state. Split out of the device
+    // callback so --render can pump it by hand — one frame's worth of samples
+    // per rendered frame, off the same virtual clock as the picture, which is
+    // what keeps the two in step when frames are not drawn in real time.
+    void mixInto(float* dst, ma_uint32 frames) {
         std::fill(dst,dst+frames*cfg::AUDIO_CH,0.f);
-        if (self->vidSrc&&!self->vidSrc->audioBuf.empty()) {
-            auto& buf=self->vidSrc->audioBuf;
-            size_t pos=self->vidSrc->audioPos.load();
-            const float gain = 0.8f * self->bgGain.load();
+        if (vidSrc&&!vidSrc->audioBuf.empty()) {
+            auto& buf=vidSrc->audioBuf;
+            size_t pos=vidSrc->audioPos.load();
+            const float gain = 0.8f * bgGain.load();
             for (ma_uint32 i=0;i<frames*cfg::AUDIO_CH;++i,++pos) {
                 if (pos>=buf.size()) pos=0;
                 dst[i]+=buf[pos]*gain;
             }
-            self->vidSrc->audioPos.store(pos);
+            vidSrc->audioPos.store(pos);
         }
-        if (self->vidSrc2&&!self->vidSrc2->audioBuf.empty()) {
-            auto& buf=self->vidSrc2->audioBuf;
-            size_t pos=self->vidSrc2->audioPos.load();
-            const float gain = 0.8f * self->bgGain2.load();
+        if (vidSrc2&&!vidSrc2->audioBuf.empty()) {
+            auto& buf=vidSrc2->audioBuf;
+            size_t pos=vidSrc2->audioPos.load();
+            const float gain = 0.8f * bgGain2.load();
             for (ma_uint32 i=0;i<frames*cfg::AUDIO_CH;++i,++pos) {
                 if (pos>=buf.size()) pos=0;
                 dst[i]+=buf[pos]*gain;
             }
-            self->vidSrc2->audioPos.store(pos);
+            vidSrc2->audioPos.store(pos);
         }
-        if (self->walkPlay&&self->walkPlay->load()&&self->walkPcm) {
-            auto& wb=*self->walkPcm;
-            size_t wp=self->walkPos->load();
+        if (walkPlay&&walkPlay->load()&&walkPcm) {
+            auto& wb=*walkPcm;
+            size_t wp=walkPos->load();
             // Softer than video audio (which mixes at 0.8x) so walking sits
             // under the bg audio instead of masking it.
             constexpr float kWalkGain = 0.5f;
             for (ma_uint32 i=0;i<frames*cfg::AUDIO_CH&&wp<wb.size();++i,++wp)
                 dst[i]+=wb[wp]*kWalkGain;
             if (wp>=wb.size()) {
-                if (self->walkLoop->load()) wp=0;
-                else{self->walkPlay->store(false);wp=0;}
+                if (walkLoop->load()) wp=0;
+                else{walkPlay->store(false);wp=0;}
             }
-            self->walkPos->store(wp);
+            walkPos->store(wp);
         }
     }
 
+    static void callback(ma_device* dev, void* out, const void*, ma_uint32 frames) {
+        static_cast<AudioMixer*>(dev->pUserData)->mixInto(static_cast<float*>(out), frames);
+    }
+
     bool init() {
+        // Rendering has no speakers to open — the mix is pumped straight to a
+        // wav instead, so starting a playback device would only fight with it.
+        if (rnd::on) return true;
         ma_device_config c=ma_device_config_init(ma_device_type_playback);
         c.playback.format=ma_format_f32; c.playback.channels=cfg::AUDIO_CH;
         c.sampleRate=cfg::AUDIO_RATE; c.dataCallback=callback; c.pUserData=this;
@@ -1103,6 +1161,8 @@ struct AudioClip {
 // ============================================================================
 struct App {
     GLFWwindow* win       = nullptr;
+    GLuint      rndFbo    = 0;        // --render only: the 1920×1080 target
+    GLuint      rndRbo    = 0;
     GLuint      prog      = 0;   // textured quad
     GLuint      progOverlay = 0; // textured quad, alpha from uniform only
     GLuint      progText  = 0;   // font atlas
@@ -1304,6 +1364,11 @@ struct App {
     // crowd, settling at 1.0 (full frame) by the widest level. Scaled about the
     // screen centre in NDC. See bgZoomNow().
     static constexpr float BG_ZOOM[4]         = { 2.00f, 1.60f, 1.28f, 1.00f };
+    // The exit voice recording is mixed in UNDER the audience as a rising overlay:
+    // each zoom-out brings it up, building anticipation. At the exit itself the
+    // audio CUTS to the title ("bird") track instead, so this swell never resolves
+    // into the voice — it just builds and is cut off. Eased by audLerp → bgGain2.
+    static constexpr float AUD_EXIT_GAIN[4]   = { 0.00f, 0.25f, 0.50f, 0.80f };
     glm::mat4 audSkew{1.f};   // current left-receding perspective, rebuilt each frame
 
     // ── Centering transition (walk → AUDIENCE_0) ─────────────────────────────
@@ -1558,7 +1623,13 @@ struct App {
     }
 
     // Used for hold-to-walk: polls directly rather than relying on callback flag
-    bool rightHeld() const { return glfwGetKey(win,GLFW_KEY_RIGHT)==GLFW_PRESS; }
+    // While rendering, the script holds RIGHT down for the whole walk so the
+    // steps chain into each other the way they do under a held key, up to the
+    // 13th, where doWalkEnd() takes over on its own.
+    bool rightHeld() const {
+        if (rnd::on) return appState==AppState::WALKING_RIGHT;
+        return glfwGetKey(win,GLFW_KEY_RIGHT)==GLFW_PRESS;
+    }
     bool leftHeld()  const { return glfwGetKey(win,GLFW_KEY_LEFT)==GLFW_PRESS; }
 
     void switchBgVideo(const std::string& path) {
@@ -1907,6 +1978,10 @@ struct App {
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
         glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+        // Rendering still needs a real context to draw into, but no one is
+        // watching it — keeping the window off screen leaves the machine usable
+        // for the length of the render.
+        if (rnd::on) glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
         win=glfwCreateWindow(cfg::WIN_W,cfg::WIN_H,"",nullptr,nullptr);
         if (!win) return false;
         glfwMakeContextCurrent(win);
@@ -1914,6 +1989,27 @@ struct App {
         glfwSetWindowUserPointer(win,this);
         glfwSetKeyCallback(win,keyCallback);
         if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return false;
+
+        // Render to an explicit WIN_W×WIN_H buffer rather than the window's own.
+        // Even hidden, the window gets fitted to the display — on this machine
+        // that hands back 3024×1714, which is not the 16:9 the piece is composed
+        // for. Bound once and never unbound: nothing else here touches
+        // framebuffer state, and every draw is in NDC, so only the resolution
+        // changes, never the composition.
+        if (rnd::on) {
+            glGenFramebuffers(1,&rndFbo);
+            glBindFramebuffer(GL_FRAMEBUFFER,rndFbo);
+            glGenRenderbuffers(1,&rndRbo);
+            glBindRenderbuffer(GL_RENDERBUFFER,rndRbo);
+            glRenderbufferStorage(GL_RENDERBUFFER,GL_RGBA8,cfg::WIN_W,cfg::WIN_H);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,
+                                      GL_RENDERBUFFER,rndRbo);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+                std::cerr<<"[render] framebuffer incomplete\n"; return false;
+            }
+            glViewport(0,0,cfg::WIN_W,cfg::WIN_H);
+        }
+
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
 
@@ -2071,13 +2167,68 @@ struct App {
                         std::chrono::steady_clock::now()-initT0).count()
                  <<" ms\n";
 
-        double t0=glfwGetTime();
+        double t0=rnd::now();
         lastIntroTime=lastBgTime=lastBgVidTime=lastSpriteTime=lastAntTime=t0;
         title.lastCharTime=title.cursorTimer=t0;
         return true;
     }
 
     // ── Run ──────────────────────────────────────────────────────────────────
+    // ── Render script ────────────────────────────────────────────────────────
+    // Stands in for the person at the keyboard while --render runs. Most of the
+    // piece carries itself once started — the intro plays to its own end, the
+    // centering eases on a timer, the outro runs out the voice recording — so
+    // this only has to start things and decide how long to linger.
+    //
+    // The walk is the one open-ended stretch: it loops the four scenes forever
+    // under a held key, so the script takes exactly one full cycle (station →
+    // grass → bridge → grass, 13 steps each) and then turns for the audience.
+    // The dwells are the pacing of the film, and the only real judgement here.
+    AppState rsState       = AppState::TITLE;
+    double   rsEnterT      = 0.0;
+    bool     rsFired       = false;
+    int      rsLastScene   = 0;
+    int      rsSceneChanges= 0;
+
+    void renderScript() {
+        if (appState != rsState) { rsState=appState; rsEnterT=rnd::clock; rsFired=false; }
+        const double held = rnd::clock - rsEnterT;
+
+        switch (appState) {
+        case AppState::TITLE:
+            // The key is ignored until the prompt has finished typing.
+            if (!rsFired && title.phase==TitleScreen::Phase::ELLIPSIS && held > 2.0) {
+                anyKeyPressed = true; rsFired = true;
+            }
+            break;
+
+        case AppState::BACK_POSE:
+            if (!rsFired && held > 1.5) { rightKeyPressed = true; rsFired = true; }
+            break;
+
+        case AppState::WALKING_RIGHT:
+            if (sceneIdx != rsLastScene) { rsLastScene = sceneIdx; ++rsSceneChanges; }
+            if (walkSub == WalkSub::IDLE) {
+                // One full pass through the scene table, then DOWN — which is
+                // deferred to the next clean IDLE and begins the centering.
+                if (rsSceneChanges >= 4) downKeyPressed  = true;
+                else if (held > 0.4)     rightKeyPressed = true;
+            }
+            break;
+
+        case AppState::AUDIENCE_0: case AppState::AUDIENCE_1:
+        case AppState::AUDIENCE_2: case AppState::AUDIENCE_3:
+            // Keys are dropped while stageT is still easing the zoom, so wait
+            // for it to settle before spending the one press this level gets.
+            if (!rsFired && stageT >= 1.f && held > 6.0) {
+                downKeyPressed = true; rsFired = true;
+            }
+            break;
+
+        default: break;   // INTRO, ENTERING_RIGHT, CENTERING, OUTRO self-advance
+        }
+    }
+
     void run() {
         while (!glfwWindowShouldClose(win)) {
             glfwPollEvents();
@@ -2085,7 +2236,9 @@ struct App {
             // Held keys from a previous state would bleed through and skip states.
             // rightHeld() is used directly inside onStepComplete() for hold-to-walk.
 
-            double now  = glfwGetTime();
+            if (rnd::on) { renderScript(); rnd::clock += 1.0/rnd::fps; }
+
+            double now  = rnd::now();
             bool advI   = (now-lastIntroTime)  >= introFrameTime;
             bool advBg  = (now-lastBgTime)     >= bgFrameTime / wavesSpeedFactor();
             bool advAnt = (now-lastAntTime)    >= antFrameTime;
@@ -2285,6 +2438,10 @@ struct App {
                 }
                 // Rebuild the crowd's left-receding skew for this eased depth.
                 audSkew = sceneSkew(audLerp(AUD_SKEW));
+                // Bring the exit voice up under the audience — louder each level —
+                // building anticipation; the exit itself then cuts to the title
+                // track (see beginOutro). Only audible once armed (first zoom-out).
+                mixer.bgGain2.store(audLerp(AUD_EXIT_GAIN));
 
                 // Keys are ignored until the move settles so a fast double-press
                 // can't skip a level.
@@ -2331,12 +2488,19 @@ struct App {
                         beginOutro(now);
                     }
                 } else if (downKeyPressed) {
-                    // DOWN = one zoom-out: reveal more crowd, shrink the man
-                    // (all driven off `stage`/`stageT`).
+                    // DOWN = one zoom-out: reveal more crowd, shrink the man, and
+                    // bring the exit-voice swell up (all driven off `stage`/`stageT`).
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                     ++stage;
                     stageT = 0.f;
                     stageStartTime = now;
+                    // First zoom-out arms the exit-voice overlay from its start so it
+                    // swells under the audience; the exit cuts to the title track.
+                    if (stage == 1) {
+                        exitAudio.audioPos = 0;
+                        mixer.vidSrc2 = &exitAudio;
+                        mixer.bgGain2.store(AUD_EXIT_GAIN[0]);
+                    }
                     appState = (stage == 1) ? AppState::AUDIENCE_1
                              : (stage == 2) ? AppState::AUDIENCE_2
                                             : AppState::AUDIENCE_3;
@@ -2623,8 +2787,37 @@ struct App {
                 }
             }
 
-            glfwSwapBuffers(win);
+            if (rnd::on) captureFrame(); else glfwSwapBuffers(win);
         }
+    }
+
+    // One rendered frame out to stdout as raw RGB, and one frame's worth of the
+    // mix out to the wav. Both are driven by the same virtual clock, so they
+    // stay locked to each other however long the frame actually took to draw.
+    void captureFrame() {
+        constexpr int fbW=cfg::WIN_W, fbH=cfg::WIN_H;   // the FBO bound in init()
+        static std::vector<unsigned char> px;
+        if (px.empty()) {
+            px.resize(size_t(fbW)*fbH*3);
+            std::cerr<<"[render] "<<fbW<<"x"<<fbH<<" @ "<<rnd::fps<<" fps\n";
+        }
+        glReadPixels(0,0,fbW,fbH,GL_RGB,GL_UNSIGNED_BYTE,px.data());
+        // GL hands back bottom-up; write the rows in reverse so ffmpeg does not
+        // have to flip a 1080p stream on the way past.
+        const size_t stride = size_t(fbW)*3;
+        for (int y=fbH-1; y>=0; --y) fwrite(px.data()+size_t(y)*stride,1,stride,stdout);
+
+        if (rnd::wav) {
+            const ma_uint32 n = (ma_uint32)llround(cfg::AUDIO_RATE/rnd::fps);
+            static std::vector<float> snd;
+            if (snd.size() < size_t(n)*cfg::AUDIO_CH) snd.resize(size_t(n)*cfg::AUDIO_CH);
+            mixer.mixInto(snd.data(), n);
+            fwrite(snd.data(), sizeof(float), size_t(n)*cfg::AUDIO_CH, rnd::wav);
+            rnd::wavSamples += n;
+        }
+
+        if (rnd::maxSec > 0.0 && rnd::clock >= rnd::maxSec)
+            glfwSetWindowShouldClose(win,GLFW_TRUE);
     }
 
     ~App() {
@@ -2656,10 +2849,26 @@ static void chdirToAssetRoot() {
     if (ec) std::cerr<<"[init] Could not enter "<<dir<<": "<<ec.message()<<"\n";
 }
 
-int main() {
-    chdirToAssetRoot();
+int main(int argc, char** argv) {
+    const char* wavPath = "render_audio.wav";
+    for (int i=1;i<argc;++i) {
+        const std::string a = argv[i];
+        if      (a=="--render")              rnd::on     = true;
+        else if (a=="--fps" && i+1<argc)     rnd::fps    = atof(argv[++i]);
+        else if (a=="--max" && i+1<argc)     rnd::maxSec = atof(argv[++i]);
+        else if (a=="--wav" && i+1<argc)     wavPath     = argv[++i];
+        else if (a=="--help") {
+            std::cerr<<"usage: anim [--render [--fps N] [--max SEC] [--wav PATH]]\n"
+                       "  --render  play the piece to a film instead of a window:\n"
+                       "            raw rgb24 frames on stdout, mix to the wav.\n";
+            return 0;
+        }
+    }
+    chdirToAssetRoot();                       // wav lands beside the assets
+    if (rnd::on) rnd::wavOpen(wavPath);
     App app;
     if (!app.init()) { std::cerr<<"Init failed.\n"; return 1; }
     app.run();
+    if (rnd::on) { rnd::wavClose(); std::cerr<<"[render] done, "<<rnd::clock<<"s\n"; }
     return 0;
 }

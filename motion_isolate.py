@@ -1,8 +1,10 @@
 """
-motion_isolate.py  (v9)
------------------------
-Tracks a small moving blob via SimpleBlobDetector on optical flow magnitude.
-- Dual-polarity detection (normal + inverted flow map)
+motion_isolate.py  (v10)
+------------------------
+Tracks a small blob via SimpleBlobDetector on a per-frame cue map.
+- Cue is optical-flow magnitude by default, or a whiteness score (--cue white)
+  for handheld footage where the camera moves as much as the subject
+- Dual-polarity detection (normal + inverted flow map; flow cue only)
 - Anchor smoothed by median-of-last-N + EMA (kills per-frame detection jitter)
 - Per-frame mask: fixed-radius radial vignette (soft edges), lightly warped by the
   thresholded flow silhouette, then EMA-blended across frames (aligned to the
@@ -76,10 +78,36 @@ def closest_blob(keypoints, anchor_xy, max_dist):
     return best_kp
 
 
-def best_blob_either_polarity(mag_norm, detector, anchor_xy, max_dist):
-    """Try normal and inverted flow map. Returns (keypoint|None, inverted:bool)."""
+def whiteness(frame, v_min: int, s_max: int) -> np.ndarray:
+    """Where the frame is bright AND unsaturated, as a smooth 0-255 map.
+
+    An alternative cue to optical flow, for footage where the camera moves as
+    much as the subject does: a handheld walk over a trail puts more flow in the
+    sliding ground than in the animal, so the flow map's brightest blob is the
+    background. Colour has no such problem — a white butterfly against orange
+    dirt is separable frame by frame, with no dependence on what moved.
+
+    It is a hard threshold rather than a graded score on purpose. Sunlit dirt is
+    bright and only moderately saturated, so a graded `V * (1 - S)` leaves a few
+    hundred speckles per frame for the detector to pick from, and the nearest one
+    to the anchor beats the real subject. Thresholding, opening away the
+    speckles, and blurring what survives leaves the detector a map with peaks
+    only where something is actually white.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    m = ((hsv[..., 2] > v_min) & (hsv[..., 1] < s_max)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    return cv2.GaussianBlur(m, (21, 21), 0)
+
+
+def best_blob_either_polarity(mag_norm, detector, anchor_xy, max_dist,
+                              try_inverted=True):
+    """Try normal and inverted cue map. Returns (keypoint|None, inverted:bool)."""
     kp_n = closest_blob(detector.detect(mag_norm),       anchor_xy, max_dist)
-    kp_i = closest_blob(detector.detect(255 - mag_norm), anchor_xy, max_dist)
+    # Only the flow cue is two-sided. On a whiteness map the inverse is "every
+    # saturated dark thing", i.e. the entire forest floor.
+    kp_i = (closest_blob(detector.detect(255 - mag_norm), anchor_xy, max_dist)
+            if try_inverted else None)
 
     if kp_n is None and kp_i is None:
         return None, False
@@ -174,24 +202,38 @@ def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
-def boil_field(h: int, w: int, cell: float, amp: float, seed: int):
+def boil_field(h: int, w: int, cell: float, amp: float, seed: int,
+               octaves: int, gain: float):
     """Two smooth random displacement maps (dx, dy) in pixels.
 
     A coarse random grid resized up is value noise by another name, and cv2 does
     the interpolation in C. `cell` is the grid pitch in pixels, so it sets the
     wavelength of the wobble; `amp` is its half-range.
+
+    Octaves matter more than amplitude for how much the *shape* changes. One
+    octave mostly slides the whole silhouette around — raising its amplitude
+    gives a rounder blob in a different place, not a different outline. Halving
+    the cell each octave adds detail that the boundary can actually bend around,
+    so `gain` near 1.0 (rather than the usual fBm 0.5) is what buys variance.
     """
-    gh = max(2, int(round(h / cell)) + 1)
-    gw = max(2, int(round(w / cell)) + 1)
     rng = np.random.default_rng(seed)
-    return tuple(
-        cv2.resize((rng.random((gh, gw), dtype=np.float32) - 0.5) * 2.0 * amp,
-                   (w, h), interpolation=cv2.INTER_CUBIC)
-        for _ in range(2)
-    )
+    out = []
+    for _ in range(2):
+        acc, norm, c, g = np.zeros((h, w), np.float32), 0.0, cell, 1.0
+        for _o in range(max(1, octaves)):
+            gh = max(2, int(round(h / c)) + 1)
+            gw = max(2, int(round(w / c)) + 1)
+            n  = (rng.random((gh, gw), dtype=np.float32) - 0.5) * 2.0
+            acc += g * cv2.resize(n, (w, h), interpolation=cv2.INTER_CUBIC)
+            norm += g
+            c = max(4.0, c / 2.0)
+            g *= gain
+        out.append(acc / norm * amp)
+    return out
 
 
-def boil_mask(mask: np.ndarray, cell: float, amp: float, seed: int) -> np.ndarray:
+def boil_mask(mask: np.ndarray, cell: float, amp: float, seed: int,
+              octaves: int, gain: float) -> np.ndarray:
     """Warp the mask's soft rim by value noise, holding the middle still.
 
     The gate is the mask's own alpha — full displacement out at the feather and
@@ -201,8 +243,8 @@ def boil_mask(mask: np.ndarray, cell: float, amp: float, seed: int) -> np.ndarra
     if amp <= 0.0:
         return mask
     h, w = mask.shape
-    dx, dy = boil_field(h, w, cell, amp, seed)
-    gate   = 1.0 - smoothstep(0.25, 0.75, mask.astype(np.float32) / 255.0)
+    dx, dy = boil_field(h, w, cell, amp, seed, octaves, gain)
+    gate   = 1.0 - smoothstep(0.20, 0.80, mask.astype(np.float32) / 255.0)
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float32),
                          np.arange(h, dtype=np.float32))
     return cv2.remap(mask, xs + dx * gate, ys + dy * gate,
@@ -282,7 +324,8 @@ def smooth_pass(args, video_path: str, output_dir: Path,
         # Boil the rim. Held for --boil-hold frames a beat: a fresh field every
         # frame is noise, not a redrawn line.
         mask = boil_mask(mask, args.boil_cell, args.boil_px,
-                         seed=entry.idx // max(1, args.boil_hold))
+                         seed=entry.idx // max(1, args.boil_hold),
+                         octaves=args.boil_octaves, gain=args.boil_gain)
 
         bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
         bgra[..., 3] = mask
@@ -376,14 +419,19 @@ def process(args) -> None:
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(
-            prev_gray, gray,
-            flow=None, pyr_scale=0.5, levels=3,
-            winsize=13, iterations=3,
-            poly_n=5, poly_sigma=1.1, flags=0,
-        )
-        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-        smooth_mag = args.smooth * mag + (1.0 - args.smooth) * smooth_mag
+        if args.cue == "white":
+            cue = whiteness(frame, args.white_v, args.white_s).astype(np.float32)
+        else:
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, gray,
+                flow=None, pyr_scale=0.5, levels=3,
+                winsize=13, iterations=3,
+                poly_n=5, poly_sigma=1.1, flags=0,
+            )
+            cue, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        # Same temporal EMA either way — it steadies a flickering detection
+        # without moving where the peak is.
+        smooth_mag = args.smooth * cue + (1.0 - args.smooth) * smooth_mag
         mag_norm   = cv2.normalize(smooth_mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
         if locked:
@@ -393,7 +441,9 @@ def process(args) -> None:
         else:
             search_r = init_r
 
-        best_kp, inverted = best_blob_either_polarity(mag_norm, detector, anchor, search_r)
+        best_kp, inverted = best_blob_either_polarity(
+            mag_norm, detector, anchor, search_r,
+            try_inverted=(args.cue == "flow"))
         is_locked_frame   = False
 
         if best_kp is not None:
@@ -546,6 +596,15 @@ def main():
     )
     p.add_argument("video")
     p.add_argument("output_dir")
+    p.add_argument("--cue",              choices=("flow", "white"), default="flow",
+                   help="What the blob detector looks at. 'flow' is optical-flow "
+                        "magnitude — right when the camera is steadier than the "
+                        "subject. 'white' scores bright, desaturated pixels, for "
+                        "handheld footage where camera motion swamps the flow map.")
+    p.add_argument("--white-v",          type=int,   default=175,
+                   help="--cue white: minimum HSV value counted as bright.")
+    p.add_argument("--white-s",          type=int,   default=55,
+                   help="--cue white: maximum HSV saturation counted as white.")
     p.add_argument("--min-area",         type=float, default=4.0)
     p.add_argument("--max-area",         type=float, default=50.0)
     p.add_argument("--max-jump",         type=int,   default=59)
@@ -565,11 +624,18 @@ def main():
                    help="EMA weight for new anchor samples after median filtering (lower = smoother, more lag).")
     p.add_argument("--anchor-median",    type=int,   default=5,
                    help="Median-filter window size over recent raw blob detections.")
-    p.add_argument("--boil-px",          type=float, default=7.0,
+    p.add_argument("--boil-px",          type=float, default=20.0,
                    help="Edge-boil amplitude (source px). 0 disables the boil.")
-    p.add_argument("--boil-cell",        type=float, default=44.0,
-                   help="Edge-boil noise wavelength (source px). Wider lobes the "
-                        "disc into a blob; tighter just reads as fuzz.")
+    p.add_argument("--boil-cell",        type=float, default=32.0,
+                   help="Edge-boil noise wavelength (source px) of the coarsest "
+                        "octave. Wider lobes the disc into a blob; tighter just "
+                        "reads as fuzz.")
+    p.add_argument("--boil-octaves",     type=int,   default=2,
+                   help="Noise octaves, each half the previous cell. More than "
+                        "one is what makes the outline vary rather than slide.")
+    p.add_argument("--boil-gain",        type=float, default=0.75,
+                   help="Amplitude ratio between successive octaves. Near 1.0 "
+                        "keeps the fine detail that bends the boundary.")
     p.add_argument("--boil-hold",        type=int,   default=2,
                    help="Frames each boil field is held for — 2 is 'on twos'.")
     p.add_argument("--smooth",           type=float, default=0.65)
