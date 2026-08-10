@@ -3,3 +3,7 @@ renders/
 exit/
 .DS_Store
 .vscode/
+.mypy_cache/
+# Build output — both are rebuilt by build.sh. Anim.app is just a wrapper
+# around the same binary, so there are two copies of it in the tree.
+Anim.app/

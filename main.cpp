@@ -3,16 +3,16 @@
 // ============================================================================
 // Build (macOS):
 //   clang -c glad/src/glad.c -Iglad/include -o glad/glad.o   (once)
-//   clang++ -std=c++17 main.cpp glad/glad.o -o anim -Iglad/include \
-//     -I/opt/homebrew/include -L/opt/homebrew/lib \
-//     -lglfw -lavcodec -lavformat -lavutil -lswscale -lswresample \
-//     -framework OpenGL
+//   ./build.sh        — builds ./anim and the double-clickable ./Anim.app
 // Build (Windows): use CMakeLists.txt with vcpkg + pre-built FFmpeg
 //
-// Run from the repo root — every asset path is relative. Two of the sprite
-// directories are generated: run `python3 audience_split.py` (level-3 audience
-// split into the layers the bug is drawn between) and `python3
-// exit_screen_assets.py` (the exit screen's tree sphere and rim) once.
+// Every asset path is relative, but the process no longer has to be started
+// from the repo root: chdirToAssetRoot() (bottom of this file) moves there on
+// startup, derived from the executable's own location. Anim.app therefore has
+// to stay in the repo root, since it finds the assets beside itself.
+//
+// One sprite directory is generated: run `python3 audience_split.py` (level-3
+// audience split into the layers the bug is drawn between) once.
 
 // ============================================================================
 // INCLUDES
@@ -76,10 +76,8 @@ namespace cfg {
     constexpr int    AUDIO_CH     = 2;
     constexpr float  FONT_SIZE_PX = 32.f;   // title prompt — small mac-terminal scale
     constexpr int    FONT_ATLAS   = 512;
-    // macOS Terminal "Grass" preset palette
-    constexpr float  GRASS_BG_R   = 0.094f;
-    constexpr float  GRASS_BG_G   = 0.384f;
-    constexpr float  GRASS_BG_B   = 0.094f;
+    // macOS Terminal "Grass" preset palette — foreground only; the title screen
+    // clears to black rather than the preset's green.
     constexpr float  GRASS_FG_R   = 0.93f;
     constexpr float  GRASS_FG_G   = 0.86f;
     constexpr float  GRASS_FG_B   = 0.55f;
@@ -235,16 +233,6 @@ static bool computeAlphaBBoxRGBA(const unsigned char* data, int w, int h,
     return true;
 }
 
-static bool computeAlphaBBox(const std::string& pngPath,
-                             float& x0, float& y0, float& x1, float& y1) {
-    int w, h, ch;
-    unsigned char* data = stbi_load(pngPath.c_str(), &w, &h, &ch, STBI_rgb_alpha);
-    if (!data) return false;
-    bool ok = computeAlphaBBoxRGBA(data, w, h, x0, y0, x1, y1);
-    stbi_image_free(data);
-    return ok;
-}
-
 // Single RGBA texture from a PNG, same filtering as SpriteSeq's frames.
 // outW/outH report the texel size, which the boiled stills need for placement
 // the same way SpriteSeq's texW/texH serve the sequences.
@@ -358,53 +346,6 @@ void main(){
     frag = vec4(c.rgb, a);
 })glsl";
 
-// Flat-tint line art that also boils. The man and the three audience levels
-// used to ship as 100-frame loops, but those frames were one drawing being
-// redrawn — ink sat a p90 of 1 px from frame 0 — so the wobble is generated
-// here instead and the assets are single stills (see boil_stills.py).
-//
-// The noise cell count is a uniform rather than a baked constant: these stills
-// are tight crops crossing a range of on-screen sizes, so drawBoiledTinted
-// derives it from the rect, keeping cells near the calibrated ~60 screen px
-// however big the drawing lands.
-static const char* FS_BOIL_TINT = R"glsl(
-#version 330 core
-in vec2 vUV; out vec4 frag;
-uniform sampler2D uTex; uniform float uAlpha; uniform vec3 uTint;
-uniform vec2  uBoilAmp;
-uniform vec2  uBoilCells;
-uniform float uBoilSeed;
-uniform float uUScale;   // horizontal crop: the quad's u=0..1 samples texture u=0..uUScale
-uniform float uFadeFrac; // soft fade to transparent over the rightmost uFadeFrac of the quad
-float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
-float vnoise(vec2 p){
-    vec2 i=floor(p), f=fract(p);
-    f=f*f*(3.0-2.0*f);
-    return mix(mix(hash(i),           hash(i+vec2(1,0)), f.x),
-               mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
-}
-void main(){
-    vec2 q = vUV * uBoilCells + uBoilSeed;
-    vec2 d = (vec2(vnoise(q), vnoise(q + 37.0)) - 0.5) * 2.0 * uBoilAmp;
-    vec2 uv = vec2(vUV.x * uUScale, vUV.y);
-    // Feather the right edge so a cut that can't land on a clean member gap
-    // dissolves into the dark instead of showing a hard partial figure.
-    float edge = (uFadeFrac > 0.0)
-               ? 1.0 - smoothstep(1.0 - uFadeFrac, 1.0, vUV.x) : 1.0;
-    frag = vec4(uTint, texture(uTex, uv + d).a * uAlpha * edge);
-})glsl";
-
-// Flat-tint line art: keep the PNG's alpha (which carries the antialiased
-// stroke) but replace its colour outright. The hand-drawn art ships as black
-// ink, which vanishes against the black backdrop these phases run on, so the
-// audience is recoloured to a white outline at draw time rather than in the
-// assets.
-static const char* FS_TINT = R"glsl(
-#version 330 core
-in vec2 vUV; out vec4 frag;
-uniform sampler2D uTex; uniform float uAlpha; uniform vec3 uTint;
-void main(){ frag = vec4(uTint, texture(uTex, vUV).a * uAlpha); })glsl";
-
 // Luma-keyed flat tint: the audience "cut" clips ship as opaque black-ink-on-white
 // video (h264, no alpha), so derive the stroke from luma — dark ink → opaque,
 // white paper → transparent — and recolour to uTint. The smoothstep threshold
@@ -511,31 +452,12 @@ static void drawTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
     drawTex(prog, q, tex, M, alpha);
 }
 
-// drawTinted through the boil shader, for the rect-placed hand-drawn stills.
-// rectW/rectH are the drawing's on-screen size in pixels, which is all the
-// conversion needs here: a UV offset of d shifts the sampled point by d*rectW
-// screen px, so the amplitude is just boilPx over the rect.
-// Cells are sized off the same rect to hold the calibrated ~60 px cell.
-static void drawBoiledTinted(GLuint prog, Quad& q, GLuint tex, const glm::mat4& M,
-                             float rectW, float rectH, float boilPx, float seed,
-                             const glm::vec3& tint, float alpha=1.f,
-                             float uScaleX=1.f, float uFade=0.f) {
-    if (!tex || rectW <= 0.f || rectH <= 0.f) return;
-    glUseProgram(prog);
-    glUniform3fv(glGetUniformLocation(prog,"uTint"),1,glm::value_ptr(tint));
-    glUniform2f(glGetUniformLocation(prog,"uBoilAmp"), boilPx/rectW, boilPx/rectH);
-    glUniform2f(glGetUniformLocation(prog,"uBoilCells"),
-                std::max(2.f, rectW/60.f), std::max(2.f, rectH/60.f));
-    glUniform1f(glGetUniformLocation(prog,"uBoilSeed"), seed);
-    glUniform1f(glGetUniformLocation(prog,"uUScale"), uScaleX);
-    glUniform1f(glGetUniformLocation(prog,"uFadeFrac"), uFade);
-    drawTex(prog, q, tex, M, alpha);
-}
-
-// A hand-drawn still that boils at runtime, standing in for what used to be a
-// 100-frame PNG loop. w/h mirror SpriteSeq's texW/texH so every placement
-// expression that sized itself off the sequence still reads the same.
-struct BoilStill {
+// A hand-drawn still, standing in for what used to be a 100-frame PNG loop —
+// those frames were one drawing being redrawn (ink sat a p90 of 1 px from
+// frame 0), so they were baked down to a single image by boil_stills.py. w/h
+// mirror SpriteSeq's texW/texH so every placement expression that sized itself
+// off the sequence still reads the same.
+struct Still {
     GLuint tex = 0;
     int    w = 0, h = 0;
     bool   loaded = false;
@@ -1186,8 +1108,6 @@ struct App {
     GLuint      progText  = 0;   // font atlas
     GLuint      progPlain = 0;   // solid color debug
     GLuint      progHGrad = 0;   // horizontal alpha gradient — audience darkening
-    GLuint      progBoilTint = 0;// hand-drawn line wobble, recoloured — the crowd
-    GLuint      progTint  = 0;   // textured quad, alpha kept, colour replaced
     GLuint      progLumaTint = 0;// opaque black-on-white video → tinted ink (audience cuts)
     Quad        quad;
 
@@ -1313,13 +1233,20 @@ struct App {
     bool downKeyPressed  = false;
 
     // Audience / OUTRO state
-    SpriteSeq seqSmoothBug;       // 301 RGBA frames — bug clip, played once in OUTRO
+    // Three bug clips — the original render and two phone captures, each cut out
+    // by motion_isolate.py and cropped to its own travelled box. One is drawn at
+    // random per appearance (see bugClip), so the crowd doesn't get the same
+    // insect walking the same path every time. They are different sizes; every
+    // placement expression reads the chosen clip's texW/texH.
+    static constexpr int BUG_CLIPS = 3;
+    SpriteSeq seqBug[BUG_CLIPS];
+    int       bugClip = 0;        // which one the current appearance is playing
     SpriteSeq seqExit;            // exit/ frame sequence — final exit animation
     bool      pendingCenter = false;   // set when DOWN pressed during a walk
     // The centered man is one digital sprite (enter_right/0089) that replaces
     // the old hand-drawn "standing man" — the whole audience section is drawn
     // with it. manCentroidX/manBottomY are measured off it at load.
-    BoilStill manSprite;
+    Still     manSprite;
     // Waves overlay strength: 0.5 while walking, 2.0 as the audience backdrop.
     // It always draws full-frame now (no camera scale), so no scale member.
     float     wavesAlpha = 0.5f;
@@ -1362,7 +1289,7 @@ struct App {
     // Per-level scene effects, eased between levels by stageT (see audLerp). A gentle
     // left-receding skew deepens as the crowd recedes (the clips already carry drawn
     // perspective; this adds a touch more).
-    static constexpr float AUD_SKEW[4]      = { 0.00f, 0.00f, 0.05f, 0.10f }; // left-recede
+    static constexpr float AUD_SKEW[4]      = { 0.00f, 0.00f, 0.10f, 0.20f }; // left-recede
     static constexpr float AUD_LEFT_DARK[4] = { 0.10f, 0.20f, 0.30f, 0.40f }; // left gradient
     static constexpr float AUD_DARK_BG      = 0.35f;   // flat darken over the video
     // Per-level crowd scale (× AUD_WORLD_SCALE). Index [0] is the (larger) size the
@@ -1372,10 +1299,6 @@ struct App {
     // recedes. The reveal eases the incoming clip from the previous level's size
     // down to its own (see render), so it fades in "outwards-in" over the previous.
     static constexpr float AUD_CROWD_SCALE[4] = { 1.35f, 1.25f, 1.15f, 1.00f };
-    // The outro voice recording is mixed in UNDER the audience as a rising overlay:
-    // each zoom-out brings it up, until the exit itself plays it at full volume.
-    // Eased by audLerp; used as mixer.bgGain2 while exitAudio is the 2nd source.
-    static constexpr float AUD_EXIT_GAIN[4]   = { 0.00f, 0.25f, 0.50f, 0.80f };
     // Background video zoom, per level: the centering slide pushes the camera IN
     // (bg magnifies to BG_ZOOM[0]); each step back pulls it OUT with the man and
     // crowd, settling at 1.0 (full frame) by the widest level. Scaled about the
@@ -1431,14 +1354,15 @@ struct App {
     float  bugPosX = 0.f, bugPosY = 0.f;   // screen point the bug crawls around
     static constexpr double BUG_ROLL_SEC = 1.0;
     static constexpr float  BUG_PROB     = 0.20f;
-    static constexpr float  BUG_SCALE    = 0.45f;   // shrink the 1920×1080 clip
+    // reencode.py crops the clip to the box the cut-out travels over, so the
+    // frame IS the content: it is placed centred on bugPosX/Y and inset by its
+    // own half-size, which keeps every frame of the bug inside the crowd. That
+    // makes BUG_SCALE a texel-to-screen ratio — the disc lands ~120 px across
+    // whatever the crop came out at — rather than a fraction of the window.
+    // The rim's boil is baked into the frames by motion_isolate.py, so nothing
+    // is done to it here; it draws like any other clip.
+    static constexpr float  BUG_SCALE    = 0.45f;
     static constexpr float  BUG_ALPHA    = 0.55f;   // sit under the ink, not on it
-    // The motion-isolated clip is a ~236 px disc that wanders over texels
-    // x 716–1094, y 447–775 across its 301 frames. Placing by the centre of
-    // that travelled box, and insetting by its half-extent, keeps every frame
-    // of the bug inside the crowd.
-    static constexpr float  BUG_CONTENT_CX = 905.f, BUG_CONTENT_CY = 611.f;
-    static constexpr float  BUG_CONTENT_HX = 189.f, BUG_CONTENT_HY = 164.f;
     std::mt19937 bugRng{ std::random_device{}() };
     std::uniform_real_distribution<float> bugRoll{0.f, 1.f};
 
@@ -1820,32 +1744,27 @@ struct App {
         // the bug and the man all go.
         manSprite.unload();
         seqAudL1.unload(); seqAudL2.unload(); seqAudL3.unload();
-        seqSmoothBug.unload();
+        for (SpriteSeq& b : seqBug) b.unload();
         seqBg.unload();          // waves overlay is deliberately absent here
         bgTex = 0;
         bugActive = false;
 
-        // The outro voice has been building UNDER the audience (mixer.vidSrc2)
-        // since the first zoom-out. Promote it to the sole source and CONTINUE
-        // from where it is — no restart — so it flows straight from the build-up
-        // into the exit at full volume. The exit animation is spread over whatever
-        // of the recording remains.
+        // The exit cuts immediately to the title ("bird") track — the exit voice
+        // recording is not used. Restart the title track from the top at full volume
+        // as the sole source and spread the exit frames across one play of it, then
+        // the app quits when that play finishes.
         const double perSec = (double)(cfg::AUDIO_CH * cfg::AUDIO_RATE);
-        const double bufSec = exitAudio.audioBuf.empty() ? 0.0
-                            : (double)exitAudio.audioBuf.size() / perSec;
-        double remaining = bufSec - (double)exitAudio.audioPos.load() / perSec;
-        if (remaining < 1.0) {           // barely any left (lingered / looped) — restart clean
-            exitAudio.audioPos = 0;
-            remaining = bufSec;
-        }
-        if (remaining <= 0.0) remaining = (double)seqExit.frames.size() * OUTRO_FRAME_SEC;
-        mixer.vidSrc  = &exitAudio;
+        double dur = titleAudio.audioBuf.empty() ? 0.0
+                   : (double)titleAudio.audioBuf.size() / perSec;
+        if (dur <= 0.0) dur = (double)seqExit.frames.size() * OUTRO_FRAME_SEC;
+        titleAudio.audioPos = 0;
+        mixer.vidSrc  = &titleAudio;
         mixer.vidSrc2 = nullptr;
-        mixer.bgGain.store(1.0f);        // full volume for the exit itself
+        mixer.bgGain.store(1.0f);
         exitFrameSec = seqExit.frames.empty()
-            ? OUTRO_FRAME_SEC : remaining / (double)seqExit.frames.size();
+            ? OUTRO_FRAME_SEC : dur / (double)seqExit.frames.size();
         lastExitFrameTime = now;
-        outroEndTime      = now + remaining;
+        outroEndTime      = now + dur;
         appState          = AppState::OUTRO;
     }
 
@@ -2003,8 +1922,6 @@ struct App {
         progText    = makeProgram(VS_SRC,   FS_TEXT);
         progPlain   = makeProgram(VS_PLAIN, FS_PLAIN);
         progHGrad   = makeProgram(VS_SRC,   FS_HGRAD);
-        progBoilTint= makeProgram(VS_SRC,   FS_BOIL_TINT);
-        progTint    = makeProgram(VS_SRC,   FS_TINT);
         progLumaTint= makeProgram(VS_SRC,   FS_LUMA_TINT);
         quad.init();
 
@@ -2104,10 +2021,17 @@ struct App {
         if (!seqAudL3.loadVideo("renders/seq/audience_l3.mp4",/*wantAlpha=*/false))
             std::cerr<<"[aud] No renders/seq/audience_l3.mp4\n";
 
-        // Bug clip frames — played during AUDIENCE_3. Still the full 1920×1080
-        // frame, so BUG_CONTENT_* below stay valid.
-        if (!seqSmoothBug.loadVideo("renders/seq/smooth_bug.mov"))
-            std::cerr<<"[bug] No frames in renders/seq/smooth_bug.mov (run reencode.py)\n";
+        // Bug clips — one is picked per appearance during AUDIENCE_3. Each is
+        // cropped to its own cut-out's travelled box by reencode.py, so texW/texH
+        // are what the placement reads; nothing here assumes a 1920×1080 frame
+        // any more. A missing clip is not fatal: the roll only draws from the
+        // ones that loaded.
+        for (int i = 0; i < BUG_CLIPS; ++i) {
+            const std::string p = "renders/seq/smooth_bug_"
+                                + std::to_string(i+1) + ".mov";
+            if (!seqBug[i].loadVideo(p))
+                std::cerr<<"[bug] No frames in "<<p<<" (run reencode.py)\n";
+        }
 
         // Exit animation frames — the final outro screen. qtrle is bit-exact, so
         // this is the same pixels the PNGs held, at ~1 ms a frame instead of 36.
@@ -2361,10 +2285,6 @@ struct App {
                 }
                 // Rebuild the crowd's left-receding skew for this eased depth.
                 audSkew = sceneSkew(audLerp(AUD_SKEW));
-                // Bring the outro voice up under the audience — louder each level
-                // — so it is already swelling by the time the exit plays. Only has
-                // effect once the overlay is armed (first zoom-out, below).
-                mixer.bgGain2.store(audLerp(AUD_EXIT_GAIN));
 
                 // Keys are ignored until the move settles so a fast double-press
                 // can't skip a level.
@@ -2376,26 +2296,34 @@ struct App {
                     // so there is never more than one on screen.
                     if (!bugActive && (now - lastBugRoll) >= BUG_ROLL_SEC) {
                         lastBugRoll = now;
-                        if (!seqSmoothBug.frames.empty() && bugRoll(bugRng) < BUG_PROB) {
-                            seqSmoothBug.reset();
+                        // Draw from the clips that actually loaded, so a missing
+                        // .mov costs variety rather than showing nothing.
+                        int avail[BUG_CLIPS], n = 0;
+                        for (int i = 0; i < BUG_CLIPS; ++i)
+                            if (!seqBug[i].frames.empty()) avail[n++] = i;
+                        if (n > 0 && bugRoll(bugRng) < BUG_PROB) {
+                            bugClip = avail[std::min(n-1, (int)(bugRoll(bugRng)*n))];
+                            SpriteSeq& bug = seqBug[bugClip];
+                            bug.reset();
                             bugActive = true;
                             lastOutroFrameTime = now;
-                            // Drop it somewhere in the crowd, inset far enough
-                            // that the clip's whole travelled area stays inside.
+                            // Drop it somewhere in the crowd, inset by half the
+                            // drawn clip — which is the travelled area, since the
+                            // crop is that box — so it stays inside.
                             float x0,y0,x1,y1;
                             audienceRect(x0,y0,x1,y1);
-                            x0 += BUG_SCALE*BUG_CONTENT_HX;
-                            x1 -= BUG_SCALE*BUG_CONTENT_HX;
-                            y0 += BUG_SCALE*BUG_CONTENT_HY;
-                            y1 -= BUG_SCALE*BUG_CONTENT_HY;
+                            const float hx = 0.5f*BUG_SCALE*(float)bug.texW;
+                            const float hy = 0.5f*BUG_SCALE*(float)bug.texH;
+                            x0 += hx; x1 -= hx;
+                            y0 += hy; y1 -= hy;
                             bugPosX = x0 + bugRoll(bugRng)*std::max(0.f, x1-x0);
                             bugPosY = y0 + bugRoll(bugRng)*std::max(0.f, y1-y0);
                         }
                     }
                     if (bugActive && (now - lastOutroFrameTime) >= OUTRO_FRAME_SEC) {
                         lastOutroFrameTime = now;
-                        seqSmoothBug.advance();
-                        if (seqSmoothBug.done) bugActive = false;
+                        seqBug[bugClip].advance();
+                        if (seqBug[bugClip].done) bugActive = false;
                     }
                     // Only another DOWN heads for the exit.
                     if (downKeyPressed) {
@@ -2403,20 +2331,12 @@ struct App {
                         beginOutro(now);
                     }
                 } else if (downKeyPressed) {
-                    // DOWN = one zoom-out: reveal more crowd, shrink the man, and
-                    // bring the outro voice up (all driven off `stage`/`stageT`).
+                    // DOWN = one zoom-out: reveal more crowd, shrink the man
+                    // (all driven off `stage`/`stageT`).
                     anyKeyPressed = rightKeyPressed = leftKeyPressed = downKeyPressed = false;
                     ++stage;
                     stageT = 0.f;
                     stageStartTime = now;
-                    // First zoom-out arms the outro-voice overlay from its start;
-                    // it plays under the audience (rising with AUD_EXIT_GAIN) and is
-                    // promoted to the sole source, mid-recording, when the exit plays.
-                    if (stage == 1) {
-                        exitAudio.audioPos = 0;
-                        mixer.vidSrc2 = &exitAudio;
-                        mixer.bgGain2.store(AUD_EXIT_GAIN[0]);
-                    }
                     appState = (stage == 1) ? AppState::AUDIENCE_1
                              : (stage == 2) ? AppState::AUDIENCE_2
                                             : AppState::AUDIENCE_3;
@@ -2528,6 +2448,21 @@ struct App {
                     drawTex(prog,quad,bgVidTex,bgM);
                     glEnable(GL_BLEND);
 
+                    // Bug (AUDIENCE_3): drawn just above the background video and
+                    // BELOW the darkening, waves and crowd — part of the backdrop,
+                    // at full opacity like the video (the darkening/wash then dim it
+                    // the same way). Positioned in the crowd via the current skew.
+                    if (bugActive)
+                        if (GLuint bugTx = seqBug[bugClip].current()) {
+                            const float bw = BUG_SCALE*(float)seqBug[bugClip].texW;
+                            const float bh = BUG_SCALE*(float)seqBug[bugClip].texH;
+                            drawTex(prog, quad, bugTx,
+                                    audSkew * rectMatrix(bugPosX - 0.5f*bw,
+                                                         bugPosY - 0.5f*bh,
+                                                         bw, bh),
+                                    1.0f);
+                        }
+
                     const bool inAudience =
                            appState==AppState::AUDIENCE_0
                         || appState==AppState::AUDIENCE_1
@@ -2623,15 +2558,8 @@ struct App {
                         drawCrowdLevel(stage, (stageT < 1.f) ? e : 1.f,
                                        audLerp(AUD_CROWD_SCALE));
                     }
-                    // The bug crawls over the crowd at the widest level.
-                    if (bugActive)
-                        if (GLuint bugTx = seqSmoothBug.current())
-                            drawTex(prog, quad, bugTx,
-                                    audSkew * rectMatrix(bugPosX - BUG_SCALE*BUG_CONTENT_CX,
-                                                         bugPosY - BUG_SCALE*BUG_CONTENT_CY,
-                                                         BUG_SCALE*(float)cfg::WIN_W,
-                                                         BUG_SCALE*(float)cfg::WIN_H),
-                                    BUG_ALPHA);
+                    // (The bug is drawn earlier, in the background layer, so it sits
+                    // beneath the crowd and darkening.)
 
                     // The man: digital sprite, upright, drifting left and shrinking
                     // a little more each step back.

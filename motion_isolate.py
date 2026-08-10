@@ -9,6 +9,10 @@ Tracks a small moving blob via SimpleBlobDetector on optical flow magnitude.
   current anchor) so the mask shape stays roughly constant size and only waves
   around the edges from frame to frame
 - On miss: anchor stays put, mask falls back to the vignette at the held anchor
+- Boil: the smoothed mask's rim is warped by value noise, re-rolled every
+  --boil-hold frames, so the cut-out reads as a redrawn edge instead of a clean
+  disc. Only the mask is warped — the footage under it is never resampled,
+  because the alpha is what selects from a frame that is valid everywhere.
 - Outputs per-frame PNGs to {output_dir}/frames/ + tracked.mp4 (LOCKED frames only)
 
 Usage:
@@ -162,6 +166,51 @@ def detection_mask(mag_norm: np.ndarray, inverted: bool, anchor: tuple,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Edge boil
+# ─────────────────────────────────────────────────────────────────────────────
+
+def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def boil_field(h: int, w: int, cell: float, amp: float, seed: int):
+    """Two smooth random displacement maps (dx, dy) in pixels.
+
+    A coarse random grid resized up is value noise by another name, and cv2 does
+    the interpolation in C. `cell` is the grid pitch in pixels, so it sets the
+    wavelength of the wobble; `amp` is its half-range.
+    """
+    gh = max(2, int(round(h / cell)) + 1)
+    gw = max(2, int(round(w / cell)) + 1)
+    rng = np.random.default_rng(seed)
+    return tuple(
+        cv2.resize((rng.random((gh, gw), dtype=np.float32) - 0.5) * 2.0 * amp,
+                   (w, h), interpolation=cv2.INTER_CUBIC)
+        for _ in range(2)
+    )
+
+
+def boil_mask(mask: np.ndarray, cell: float, amp: float, seed: int) -> np.ndarray:
+    """Warp the mask's soft rim by value noise, holding the middle still.
+
+    The gate is the mask's own alpha — full displacement out at the feather and
+    beyond it, none in the opaque core — so the silhouette waves without the
+    interior sliding around. Ungated, the whole disc would swim.
+    """
+    if amp <= 0.0:
+        return mask
+    h, w = mask.shape
+    dx, dy = boil_field(h, w, cell, amp, seed)
+    gate   = 1.0 - smoothstep(0.25, 0.75, mask.astype(np.float32) / 255.0)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32),
+                         np.arange(h, dtype=np.float32))
+    return cv2.remap(mask, xs + dx * gate, ys + dy * gate,
+                     cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Smoothing post-process
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -229,6 +278,11 @@ def smooth_pass(args, video_path: str, output_dir: Path,
             mask[y0:y0+mh, x0:x0+mw] = entry.mask_crop
         else:
             cv2.circle(mask, (int(entry.cx), int(entry.cy)), args.dilate, 255, -1)
+
+        # Boil the rim. Held for --boil-hold frames a beat: a fresh field every
+        # frame is noise, not a redrawn line.
+        mask = boil_mask(mask, args.boil_cell, args.boil_px,
+                         seed=entry.idx // max(1, args.boil_hold))
 
         bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
         bgra[..., 3] = mask
@@ -511,6 +565,13 @@ def main():
                    help="EMA weight for new anchor samples after median filtering (lower = smoother, more lag).")
     p.add_argument("--anchor-median",    type=int,   default=5,
                    help="Median-filter window size over recent raw blob detections.")
+    p.add_argument("--boil-px",          type=float, default=7.0,
+                   help="Edge-boil amplitude (source px). 0 disables the boil.")
+    p.add_argument("--boil-cell",        type=float, default=44.0,
+                   help="Edge-boil noise wavelength (source px). Wider lobes the "
+                        "disc into a blob; tighter just reads as fuzz.")
+    p.add_argument("--boil-hold",        type=int,   default=2,
+                   help="Frames each boil field is held for — 2 is 'on twos'.")
     p.add_argument("--smooth",           type=float, default=0.65)
     p.add_argument("--smooth-knots",     type=int,   default=15,
                    help="Number of cubic-spline knots sampled uniformly across the trajectory.")
